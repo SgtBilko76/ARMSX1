@@ -1,3 +1,4 @@
+#include "depth.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -444,6 +445,13 @@ void gpu_render_triangle(psx_gpu_t* gpu, vertex_t v0, vertex_t v1, vertex_t v2, 
             }
 
             gpu->vram[x + (y * 1024)] = color;
+
+            // Semi-transparent pixels keep the depth of what shows through them.
+            if (gpu->depth && !transp) {
+                gpu->depth[x + (y * 1024)] = (a.w < 0.0f)
+                    ? PSX_DEPTH_FLAT
+                    : ((z0 * a.w) + (z1 * b.w) + (z2 * c.w)) / area;
+            }
         }
     }
 }
@@ -585,6 +593,9 @@ void gpu_render_rect(psx_gpu_t* gpu, rect_data_t data) {
 
             gpu->vram[x + (y * 1024)] = color;
 
+            if (gpu->depth && !transp)
+                gpu->depth[x + (y * 1024)] = PSX_DEPTH_FLAT;
+
             skip:
 
             ++xc;
@@ -611,8 +622,12 @@ void plotLineLow(psx_gpu_t* gpu, int x0, int y0, int x1, int y1, uint16_t color)
         int bc = (x >= gpu->draw_x1) && (x <= gpu->draw_x2) &&
                  (y >= gpu->draw_y1) && (y <= gpu->draw_y2);
 
-        if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0) && bc)
+        if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0) && bc) {
             gpu->vram[x + (y * 1024)] = color;
+
+            if (gpu->depth)
+                gpu->depth[x + (y * 1024)] = PSX_DEPTH_FLAT;
+        }
 
         if (d > 0) {
             y += yi;
@@ -638,8 +653,12 @@ void plotLineHigh(psx_gpu_t* gpu, int x0, int y0, int x1, int y1, uint16_t color
         int bc = (x >= gpu->draw_x1) && (x <= gpu->draw_x2) &&
                  (y >= gpu->draw_y1) && (y <= gpu->draw_y2);
 
-        if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0) && bc)
+        if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0) && bc) {
             gpu->vram[x + (y * 1024)] = color;
+
+            if (gpu->depth)
+                gpu->depth[x + (y * 1024)] = PSX_DEPTH_FLAT;
+        }
 
         if (d > 0) {
             x = x + xi;
@@ -1152,6 +1171,31 @@ void gpu_poly(psx_gpu_t* gpu) {
                 poly.v[2].ty = (gpu->buf[2+2*texc_offset] >> 8) & 0xff;
                 poly.v[3].ty = (gpu->buf[2+3*texc_offset] >> 8) & 0xff;
 
+                if (gpu->depth) {
+                    // Match each vertex word against the GTE's recent projections. A vertex the
+                    // GTE did not produce borrows the average of the ones it did; a polygon with
+                    // none is 2D and stays flat.
+                    const int count = (poly.attrib & PA_QUAD) ? 4 : 3;
+                    float sum = 0.0f;
+                    int known = 0;
+
+                    for (int i = 0; i < count; i++) {
+                        poly.v[i].w = psx_depth_lookup(gpu->buf[1+i*vert_offset]);
+
+                        if (poly.v[i].w >= 0.0f) {
+                            sum += poly.v[i].w;
+                            known++;
+                        }
+                    }
+
+                    const float fallback = known ? (sum / (float)known) : PSX_DEPTH_FLAT;
+
+                    for (int i = 0; i < 4; i++) {
+                        if (i >= count || poly.v[i].w < 0.0f)
+                            poly.v[i].w = fallback;
+                    }
+                }
+
 #ifdef USE_HARDWARE
                 if (gpu->renderer.render_triangle) {
                     if (poly.attrib & PA_QUAD) {
@@ -1288,6 +1332,9 @@ void gpu_cmd_a0(psx_gpu_t* gpu) {
 
             gpu->vram[xpos + (ypos * 1024)] = gpu->recv_data & 0xffff;
 
+            if (gpu->depth)
+                gpu->depth[xpos + (ypos * 1024)] = PSX_DEPTH_FLAT;
+
             ++gpu->xcnt;
 
             xpos = (gpu->xpos + gpu->xcnt) & 0x3ff;
@@ -1302,6 +1349,9 @@ void gpu_cmd_a0(psx_gpu_t* gpu) {
             }
 
             gpu->vram[xpos + (ypos * 1024)] = gpu->recv_data >> 16;
+
+            if (gpu->depth)
+                gpu->depth[xpos + (ypos * 1024)] = PSX_DEPTH_FLAT;
 
             ++gpu->xcnt;
             
@@ -1845,8 +1895,12 @@ void gpu_cmd_02(psx_gpu_t* gpu) {
                         // if (!bc)
                         //     continue;
 
-                        if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0))
+                        if ((x < 1024) && (y < 512) && (x >= 0) && (y >= 0)) {
                             gpu->vram[x + (y * 1024)] = color;
+
+                            if (gpu->depth)
+                                gpu->depth[x + (y * 1024)] = PSX_DEPTH_FAR;
+                        }
                     }
                 }
 
@@ -1879,8 +1933,12 @@ void gpu_cmd_80(psx_gpu_t* gpu) {
                         int dstb = ((dstx + x) < 1024) && ((dsty + y) < 512);
                         int srcb = ((srcx + x) < 1024) && ((srcy + y) < 512);
                         
-                        if (dstb && srcb)
+                        if (dstb && srcb) {
                             gpu->vram[(dstx + x) + (dsty + y) * 1024] = gpu->vram[(srcx + x) + (srcy + y) * 1024];
+
+                            if (gpu->depth)
+                                gpu->depth[(dstx + x) + (dsty + y) * 1024] = gpu->depth[(srcx + x) + (srcy + y) * 1024];
+                        }
                     }
                 }
 
@@ -2202,7 +2260,34 @@ void* psx_gpu_get_display_buffer(psx_gpu_t* gpu) {
     return gpu->vram + (gpu->disp_x + (gpu->disp_y * 1024));
 }
 
+void psx_gpu_set_depth_enabled(psx_gpu_t* gpu, int enabled) {
+    if (enabled && !gpu->depth) {
+        gpu->depth = malloc(PSX_GPU_FB_WIDTH * PSX_GPU_FB_HEIGHT * sizeof(float));
+
+        if (gpu->depth) {
+            for (int i = 0; i < PSX_GPU_FB_WIDTH * PSX_GPU_FB_HEIGHT; i++)
+                gpu->depth[i] = PSX_DEPTH_FLAT;
+        }
+    } else if (!enabled && gpu->depth) {
+        free(gpu->depth);
+        gpu->depth = NULL;
+    }
+
+    psx_depth_set_capture(gpu->depth != NULL);
+}
+
+const float* psx_gpu_get_display_depth(psx_gpu_t* gpu) {
+    if (!gpu->depth || (gpu->gpustat & 0x800000))
+        return NULL;
+
+    return gpu->depth + (gpu->disp_x + (gpu->disp_y * 1024));
+}
+
 void psx_gpu_destroy(psx_gpu_t* gpu) {
+    if (gpu->depth)
+        psx_depth_set_capture(0);
+
+    free(gpu->depth);
     free(gpu->vram);
     free(gpu);
 }

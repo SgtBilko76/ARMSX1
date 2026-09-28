@@ -24,11 +24,29 @@ void psx_load_exe(psx_t* psx, const char* path) {
     psx_exe_load(psx->cpu, path);
 }
 
+// Fast path of psx_gpu_update for the per-instruction loop. Scanline events only happen once the
+// GPU's cycle count reaches the start of hblank; below it an update is nothing but the addition,
+// done here with the very same float expression. Everything else goes to psx_gpu_update, which
+// recomputes that step itself.
+#define PSX_GPU_CYCLES_PER_HDRAW 2560.0f
+
+static inline void psx_gpu_step(psx_gpu_t* gpu, int cyc) {
+    const float gpu_clock = psx_gpu_clock_frequency(gpu);
+    const float next = gpu->cycles + (float)cyc * (gpu_clock / PSX_CPU_FREQ);
+
+    if (next < PSX_GPU_CYCLES_PER_HDRAW) {
+        gpu->cycles = next;
+        return;
+    }
+
+    psx_gpu_update(gpu, cyc);
+}
+
 void psx_update(psx_t* psx) {
     psx_cpu_cycle(psx->cpu);
 
     psx_cdrom_update(psx->cdrom, psx->cpu->last_cycles);
-    psx_gpu_update(psx->gpu, psx->cpu->last_cycles);
+    psx_gpu_step(psx->gpu, psx->cpu->last_cycles);
     psx_pad_update(psx->pad, psx->cpu->last_cycles);
     psx_timer_update(psx->timer, psx->cpu->last_cycles);
     psx_dma_update(psx->dma, psx->cpu->last_cycles);
@@ -46,6 +64,14 @@ void psx_run_frame(psx_t* psx) {
 
 void* psx_get_display_buffer(psx_t* psx) {
     return psx_gpu_get_display_buffer(psx->gpu);
+}
+
+void psx_set_stereo_depth(psx_t* psx, int enabled) {
+    psx_gpu_set_depth_enabled(psx->gpu, enabled);
+}
+
+const float* psx_get_display_depth(psx_t* psx) {
+    return psx_gpu_get_display_depth(psx->gpu);
 }
 
 void* psx_get_vram(psx_t* psx) {

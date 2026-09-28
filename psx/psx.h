@@ -47,6 +47,10 @@ void psx_load_exe(psx_t*, const char*);
 void psx_update(psx_t*);
 void psx_run_frame(psx_t*);
 void* psx_get_display_buffer(psx_t*);
+/* Stereo depth side channel (psx/dev/depth.h), off by default. The depth buffer shares the
+   display buffer's layout: 1024 floats per row. NULL while off or in 24-bit display mode. */
+void psx_set_stereo_depth(psx_t*, int);
+const float* psx_get_display_depth(psx_t*);
 void* psx_get_vram(psx_t*);
 uint32_t psx_get_dmode_width(psx_t*);
 uint32_t psx_get_dmode_height(psx_t*);

@@ -41,6 +41,45 @@ struct psx_bus_t {
     void* write_observer_udata;
 };
 
+extern const uint32_t g_psx_bus_region_mask_table[];
+
+/*
+    psx_bus_read32 for the hot callers (instruction fetch and word loads). Code and most data live
+    in RAM or the BIOS, so those two are decoded inline with exactly the semantics of their
+    HANDLE_READ entries and psx_ram_read32/psx_bios_read32; anything else, and unaligned
+    addresses, take the full bus path.
+*/
+static inline uint32_t psx_bus_read32_fast(psx_bus_t* bus, uint32_t addr) {
+    const uint32_t phys = addr & g_psx_bus_region_mask_table[addr >> 29];
+
+    if (!(phys & 0x3)) {
+        const psx_ram_t* ram = bus->ram;
+
+        if ((phys >= ram->io_base) && (phys < (ram->io_base + ram->io_size))) {
+            uint32_t offset = phys - ram->io_base;
+
+            bus->access_cycles = ram->bus_delay;
+
+            if ((((ram->mc2->ram_size >> 9) & 7) == 3) && (offset >= 0x400000))
+                return 0xffffffff;
+
+            offset &= ram->size - 1;
+
+            return *((const uint32_t*)(ram->buf + offset));
+        }
+
+        const psx_bios_t* bios = bus->bios;
+
+        if ((phys >= bios->io_base) && (phys < (bios->io_base + bios->io_size))) {
+            bus->access_cycles = bios->bus_delay;
+
+            return *((const uint32_t*)(bios->buf + (phys - bios->io_base)));
+        }
+    }
+
+    return psx_bus_read32(bus, addr);
+}
+
 void psx_bus_init_bios(psx_bus_t*, psx_bios_t*);
 void psx_bus_init_ram(psx_bus_t*, psx_ram_t*);
 void psx_bus_init_dma(psx_bus_t*, psx_dma_t*);

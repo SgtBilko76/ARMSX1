@@ -33,6 +33,9 @@ typedef struct {
 
     int mdec_in_irq_delay;
     int mdec_out_irq_delay;
+    /* No IRQ delay pending and DICR settled: psx_dma_update would change nothing until the next
+       register access or transfer, all of which clear this. */
+    int quiet;
     int cdrom_irq_delay;
     int spu_irq_delay;
     int gpu_irq_delay;

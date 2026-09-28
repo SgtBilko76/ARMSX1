@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../psx/dev/depth.h"
 #include "../psx/dev/gpu.h"
 #include "../frontend/gpu_hw.h"
 
@@ -58,6 +59,69 @@ static int run_case(const char* name, vertex_t a, vertex_t b, vertex_t c, poly_d
     return 0;
 }
 
+/* The stereo depth side channel must leave VRAM untouched and record interpolated depth. */
+static int run_stereo_depth_case(void) {
+    psx_gpu_t* plain = make_gpu();
+    psx_gpu_t* stereo = make_gpu();
+    if (!plain || !stereo) {
+        fprintf(stderr, "GPU_PARITY failed case=stereo-depth reason=allocation\n");
+        return 1;
+    }
+    memset(plain->vram, 0, PSX_GPU_VRAM_SIZE);
+    memset(stereo->vram, 0, PSX_GPU_VRAM_SIZE);
+    psx_gpu_set_depth_enabled(stereo, 1);
+    if (!stereo->depth || !g_psx_depth_capture) {
+        fprintf(stderr, "GPU_PARITY failed case=stereo-depth reason=not-enabled\n");
+        return 1;
+    }
+
+    /* Vertex depths as the GTE would record them: w = H / SZ. */
+    const uint32_t words[3] = {0x00140010u, 0x00200060u, 0x00700030u};
+    psx_depth_record(words[0], 256, 512);  /* w = 0.5  */
+    psx_depth_record(words[1], 256, 1024); /* w = 0.25 */
+    psx_depth_record(words[2], 256, 256);  /* w = 1.0  */
+
+    poly_data_t data = {.attrib = 0};
+    vertex_t v[3];
+    for (int i = 0; i < 3; i++) {
+        v[i] = (vertex_t){.x = (int16_t)(words[i] & 0xffff), .y = (int16_t)(words[i] >> 16), .c = 0x40a0f0};
+        v[i].w = psx_depth_lookup(words[i]);
+        data.v[i] = v[i];
+    }
+
+    gpu_render_triangle(plain, v[0], v[1], v[2], data, 0);
+    gpu_render_triangle(stereo, v[0], v[1], v[2], data, 0);
+
+    int failed = memcmp(plain->vram, stereo->vram, PSX_GPU_VRAM_SIZE) != 0;
+    if (failed)
+        fprintf(stderr, "GPU_PARITY failed case=stereo-depth reason=vram-changed\n");
+
+    /* A pixel inside the triangle lies between the vertex depths; one outside stays flat. */
+    const float inside = stereo->depth[50 + 40 * 1024];
+    if (!(inside > 0.25f && inside < 1.0f)) {
+        fprintf(stderr, "GPU_PARITY failed case=stereo-depth reason=interpolation value=%f\n", inside);
+        failed = 1;
+    }
+    if (stereo->depth[500 + 400 * 1024] != PSX_DEPTH_FLAT) {
+        fprintf(stderr, "GPU_PARITY failed case=stereo-depth reason=untouched-not-flat\n");
+        failed = 1;
+    }
+    if (psx_depth_lookup(0x01230456u) != PSX_DEPTH_FLAT) {
+        fprintf(stderr, "GPU_PARITY failed case=stereo-depth reason=unknown-vertex\n");
+        failed = 1;
+    }
+
+    psx_gpu_destroy(plain);
+    psx_gpu_destroy(stereo);
+    if (g_psx_depth_capture) {
+        fprintf(stderr, "GPU_PARITY failed case=stereo-depth reason=capture-left-on\n");
+        failed = 1;
+    }
+    if (!failed)
+        printf("GPU_PARITY passed case=stereo-depth\n");
+    return failed;
+}
+
 int main(void) {
     int failed = 0;
     poly_data_t flat = {.attrib = 0};
@@ -91,6 +155,8 @@ int main(void) {
         transparent,
         1
     );
+
+    failed |= run_stereo_depth_case();
 
     if (failed)
         return 1;

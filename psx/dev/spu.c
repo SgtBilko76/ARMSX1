@@ -618,6 +618,13 @@ void spu_get_reverb_sample(psx_spu_t* spu, int inl, int inr, int* outl, int* out
 #undef R16
 #undef W16
 
+static inline void spu_push_history(psx_spu_t* spu, int v, int16_t sample) {
+    spu->data[v].s[3] = spu->data[v].s[2];
+    spu->data[v].s[2] = spu->data[v].s[1];
+    spu->data[v].s[1] = spu->data[v].s[0];
+    spu->data[v].s[0] = sample;
+}
+
 uint32_t psx_spu_get_sample(psx_spu_t* spu) {
     spu->even_cycle ^= 1;
 
@@ -636,6 +643,20 @@ uint32_t psx_spu_get_sample(psx_spu_t* spu) {
         spu_handle_adsr(spu, v);
 
         uint32_t sample_index = spu->data[v].counter >> 12;
+
+        // The 4-point interpolation needs the four most recent *consecutive* source samples. Above
+        // pitch 1.0 a voice skips samples between two output samples, so push every sample it
+        // passed -- the rest of the old block first, then the new one -- not just the latest.
+        // At pitch 1.0 and below this is exactly the previous one-shift-per-index behaviour.
+        const uint32_t prev_index = spu->data[v].prev_sample_index;
+        const int index_moved = sample_index != prev_index;
+
+        if (index_moved && (sample_index > prev_index)) {
+            const uint32_t old_last = (sample_index > 27) ? 27 : sample_index;
+
+            for (uint32_t j = prev_index + 1; j <= old_last; j++)
+                spu_push_history(spu, v, spu->data[v].buf[j]);
+        }
 
         if (sample_index > 27) {
             sample_index -= 28;
@@ -676,15 +697,15 @@ uint32_t psx_spu_get_sample(psx_spu_t* spu) {
             }
 
             spu_read_block(spu, v);
+
+            for (uint32_t j = 0; j <= sample_index; j++)
+                spu_push_history(spu, v, spu->data[v].buf[j]);
+        } else if (index_moved && (sample_index < prev_index)) {
+            // The counter was reset (key on): start the history from the current sample.
+            spu_push_history(spu, v, spu->data[v].buf[sample_index]);
         }
 
         //  Fetch ADPCM sample
-        if (spu->data[v].prev_sample_index != sample_index) {
-            spu->data[v].s[3] = spu->data[v].s[2];
-            spu->data[v].s[2] = spu->data[v].s[1];
-            spu->data[v].s[1] = spu->data[v].s[0];
-        }
-
         spu->data[v].s[0] = spu->data[v].buf[sample_index];
 
         // Apply 4-point Gaussian interpolation

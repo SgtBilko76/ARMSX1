@@ -3,6 +3,8 @@
 #include <string.h>
 
 #include "timer.h"
+
+#include <math.h>
 #include "../log.h"
 
 #define T0_COUNTER     timer->timer[0].counter
@@ -51,6 +53,81 @@
 #define T2_PAUSED      timer->timer[2].paused
 #define T2_BLANK_ONCE  timer->timer[2].blank_once
 #define T2_DIV_COUNTER timer->timer[2].div_counter
+
+// The exact per-step increment of timer i, or a negative value when its step is not a constant
+// (the dotclock, which depends on the display mode) and it must be stepped one at a time.
+static inline float timer_step(const psx_timer_t* timer, int i) {
+    const int clk = timer->timer[i].clk_source;
+
+    switch (i) {
+        case 0: return (clk & 1) ? -1.0f : 2.0f;
+        case 1: return (clk & 1) ? 0.0f : 2.0f;
+        default: return (clk <= 1) ? 2.0f : 0.25f;
+    }
+}
+
+// Applies the idle steps tallied since the last full update. Each of them only added a constant
+// that stays exactly representable (the counter never passes FFFFh + 2 during idle steps), so one
+// addition gives the very same float as the step-by-step sums.
+static void timer_sync(psx_timer_t* timer) {
+    if (timer->pending) {
+        for (int i = 0; i < 3; i++) {
+            if (!timer->timer[i].paused)
+                timer->timer[i].counter += timer_step(timer, i) * (float)timer->pending;
+        }
+
+        timer->pending = 0;
+    }
+
+    timer->prev_hblank = timer->hblank;
+    timer->prev_vblank = timer->vblank;
+}
+
+// Called before anything reads or changes timer state from outside psx_timer_update.
+static inline void timer_touch(psx_timer_t* timer) {
+    timer_sync(timer);
+    timer->idle_updates = 0;
+}
+
+// How many upcoming updates are certain to do nothing but add each counter's step.
+static uint32_t timer_idle_budget(const psx_timer_t* timer) {
+    const uint32_t kMaxBudget = 1u << 16;
+    uint32_t budget = kMaxBudget;
+
+    for (int i = 0; i < 3; i++) {
+        if (timer->timer[i].paused)
+            continue;
+
+        const float step = timer_step(timer, i);
+
+        if (step < 0.0f)
+            return 0;
+
+        const double counter = timer->timer[i].counter;
+        // Once "target reached" is latched and the target neither resets the counter nor raises
+        // an IRQ, passing it again only sets the flag that is already set: only FFFFh matters.
+        const int target_inert = timer->timer[i].target_reached &&
+                                 !timer->timer[i].reset_target &&
+                                 !timer->timer[i].irq_target;
+        const double threshold = (!target_inert && ((float)timer->timer[i].target < 65535.0f))
+            ? (float)timer->timer[i].target
+            : 65535.0f;
+
+        if (counter > threshold)
+            return 0;
+
+        if (step == 0.0f)
+            continue;
+
+        // The first step that ends past the threshold must run for real.
+        const double idle = floor((threshold - counter) / step);
+
+        if (idle < (double)budget)
+            budget = (uint32_t)idle;
+    }
+
+    return budget;
+}
 
 uint16_t timer_get_mode(psx_timer_t* timer, int index) {
     uint16_t value = (timer->timer[index].sync_enable << 0)     |
@@ -163,6 +240,8 @@ void psx_timer_init(psx_timer_t* timer, psx_ic_t* ic, psx_gpu_t* gpu) {
 }
 
 uint32_t psx_timer_read32(psx_timer_t* timer, uint32_t offset) {
+    timer_touch(timer);
+
     int index = offset >> 4;
     int reg = offset & 0xf;
 
@@ -178,6 +257,8 @@ uint32_t psx_timer_read32(psx_timer_t* timer, uint32_t offset) {
 }
 
 uint16_t psx_timer_read16(psx_timer_t* timer, uint32_t offset) {
+    timer_touch(timer);
+
     int index = offset >> 4;
     int reg = offset & 0xf;
 
@@ -201,6 +282,8 @@ uint8_t psx_timer_read8(psx_timer_t* timer, uint32_t offset) {
 void timer_handle_irq(psx_timer_t* timer, int i);
 
 void psx_timer_write32(psx_timer_t* timer, uint32_t offset, uint32_t value) {
+    timer_touch(timer);
+
     int index = offset >> 4;
     int reg = offset & 0xf;
 
@@ -214,6 +297,8 @@ void psx_timer_write32(psx_timer_t* timer, uint32_t offset, uint32_t value) {
 }
 
 void psx_timer_write16(psx_timer_t* timer, uint32_t offset, uint16_t value) {
+    timer_touch(timer);
+
     int index = offset >> 4;
     int reg = offset & 0xf;
 
@@ -283,7 +368,14 @@ void timer_handle_irq(psx_timer_t* timer, int i) {
     }
 }
 
-float timer_get_dotclock_div(psx_timer_t* timer) {
+// timer_handle_irq only acts once a counter has passed its target or 0xffff. Checking that
+// inline (with the very same comparisons) keeps the per-instruction update from calling it.
+static inline void timer_check_irq(psx_timer_t* timer, int i) {
+    if ((timer->timer[i].counter > timer->timer[i].target) || (timer->timer[i].counter > 65535.0f))
+        timer_handle_irq(timer, i);
+}
+
+static inline float timer_get_dotclock_div(psx_timer_t* timer) {
     static const float dmode_dotclk_div_table[] = {
         10.0f, 8.0f, 5.0f, 4.0f
     };
@@ -295,7 +387,7 @@ float timer_get_dotclock_div(psx_timer_t* timer) {
     }
 }
 
-void timer_update_timer0(psx_timer_t* timer, int cyc) {
+static inline void timer_update_timer0(psx_timer_t* timer, int cyc) {
     if (T0_PAUSED)
         return;
 
@@ -306,10 +398,10 @@ void timer_update_timer0(psx_timer_t* timer, int cyc) {
         T0_COUNTER += (float)cyc;
     }
 
-    timer_handle_irq(timer, 0);
+    timer_check_irq(timer, 0);
 }
 
-void timer_update_timer1(psx_timer_t* timer, int cyc) {
+static inline void timer_update_timer1(psx_timer_t* timer, int cyc) {
     if (T1_PAUSED)
         return;
 
@@ -319,10 +411,10 @@ void timer_update_timer1(psx_timer_t* timer, int cyc) {
         T1_COUNTER += (float)cyc;
     }
 
-    timer_handle_irq(timer, 1);
+    timer_check_irq(timer, 1);
 }
 
-void timer_update_timer2(psx_timer_t* timer, int cyc) {
+static inline void timer_update_timer2(psx_timer_t* timer, int cyc) {
     if (T2_PAUSED)
         return;
 
@@ -332,20 +424,32 @@ void timer_update_timer2(psx_timer_t* timer, int cyc) {
         T2_COUNTER += ((float)cyc) / 8.0f;
     }
 
-    timer_handle_irq(timer, 2);
+    timer_check_irq(timer, 2);
 }
 
 void psx_timer_update(psx_timer_t* timer, int cyc) {
-    timer->prev_hblank = timer->hblank;
-    timer->prev_vblank = timer->vblank;
+    (void)cyc;
+
+    if (timer->idle_updates) {
+        timer->idle_updates--;
+        timer->pending++;
+
+        return;
+    }
+
+    timer_sync(timer);
 
     timer_update_timer0(timer, 2);
     timer_update_timer1(timer, 2);
     timer_update_timer2(timer, 2);
+
+    timer->idle_updates = timer_idle_budget(timer);
 }
 
 void psxe_gpu_hblank_event_cb(psx_gpu_t* gpu) {
     psx_timer_t* timer = gpu->udata[1];
+
+    timer_touch(timer);
 
     timer->hblank = 1;
 
@@ -375,6 +479,8 @@ void psxe_gpu_hblank_event_cb(psx_gpu_t* gpu) {
 void psxe_gpu_hblank_end_event_cb(psx_gpu_t* gpu) {
     psx_timer_t* timer = gpu->udata[1];
 
+    timer_touch(timer);
+
     timer->hblank = 0;
 
     if (!T0_SYNC_EN)
@@ -388,6 +494,8 @@ void psxe_gpu_hblank_end_event_cb(psx_gpu_t* gpu) {
 
 void psxe_gpu_vblank_timer_event_cb(psx_gpu_t* gpu) {
     psx_timer_t* timer = gpu->udata[1];
+
+    timer_touch(timer);
 
     timer->vblank = 1;
 
@@ -410,6 +518,8 @@ void psxe_gpu_vblank_timer_event_cb(psx_gpu_t* gpu) {
 
 void psxe_gpu_vblank_end_event_cb(psx_gpu_t* gpu) {
     psx_timer_t* timer = gpu->udata[1];
+
+    timer_touch(timer);
 
     timer->vblank = 0;
 

@@ -116,6 +116,16 @@ typedef struct {
         int paused;
         int blank_once;
     } timer[3];
+
+    /*
+        Lazy stepping. psx_timer_update runs after every CPU instruction, but in the usual clock
+        modes a counter only grows by an exact 2 (or 0.25) per step and nothing happens until it
+        passes its target or FFFFh. idle_updates counts the upcoming steps known to be exactly
+        that; they are only tallied in `pending` and applied in one exact addition before the
+        next step that matters or before anything looks at the timers.
+    */
+    uint32_t idle_updates;
+    uint32_t pending;
 } psx_timer_t;
 
 psx_timer_t* psx_timer_create(void);

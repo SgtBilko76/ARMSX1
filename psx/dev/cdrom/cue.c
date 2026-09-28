@@ -224,7 +224,8 @@ cue_file_t* cue_parse_file(cue_t* cue, const char* p, const char* s) {
     if (cue->c != '\"')
         return NULL;
 
-    cue_file_t* file = malloc(sizeof(cue_file_t));
+    // Zeroed: buf stays NULL for a file whose track never opens (see cue_destroy).
+    cue_file_t* file = calloc(1, sizeof(cue_file_t));
 
     file->tracks = list_create();
     file->name = malloc(512);
@@ -442,7 +443,7 @@ void cue_destroy(cue_t* cue) {
 
         if (file->buf_mode == LD_BUFFERED) {
             free(file->buf);
-        } else {
+        } else if (file->buf) {
             fclose((FILE*)file->buf);
         }
 

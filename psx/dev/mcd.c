@@ -5,6 +5,10 @@
 #include <errno.h>
 #include <string.h>
 #include <limits.h>
+#ifndef PATH_MAX
+/* Strict ISO C (the -std=c11 test builds) hides the POSIX definition. */
+#define PATH_MAX 4096
+#endif
 #ifdef _WIN32
 #include <direct.h>
 #endif

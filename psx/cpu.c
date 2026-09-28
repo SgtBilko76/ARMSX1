@@ -1,11 +1,13 @@
 #include "cpu.h"
 #include "bus.h"
+#include "bus_init.h"
 #include "log.h"
 
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include "cpu_debug.h"
+#include "dev/depth.h"
 
 #define PSX_CPU_CACHE_ENTRY_COUNT 16384u
 #define PSX_CPU_CACHE_ENTRY_MASK (PSX_CPU_CACHE_ENTRY_COUNT - 1u)
@@ -359,7 +361,7 @@ void psx_cpu_cycle(psx_cpu_t* cpu) {
     if (cpu->saved_pc & 3)
         psx_cpu_exception(cpu, CAUSE_ADEL);
 
-    cpu->opcode = psx_bus_read32(cpu->bus, cpu->pc);
+    cpu->opcode = psx_bus_read32_fast(cpu->bus, cpu->pc);
     cpu->last_cycles = psx_bus_get_access_cycles(cpu->bus);
 
     cpu->pc = cpu->next_pc;
@@ -690,7 +692,7 @@ static inline void psx_cpu_i_lwl(psx_cpu_t* cpu) {
     uint32_t t = cpu->r[rt];
 
     uint32_t addr = s + IMM16S;
-    uint32_t load = psx_bus_read32(cpu->bus, addr & 0xfffffffc);
+    uint32_t load = psx_bus_read32_fast(cpu->bus, addr & 0xfffffffc);
 
     if (rt == cpu->load_d) {
         t = cpu->load_v;
@@ -723,7 +725,7 @@ static inline void psx_cpu_i_lw(psx_cpu_t* cpu) {
         psx_cpu_exception(cpu, CAUSE_ADEL);
     } else {
         cpu->load_d = T;
-        cpu->load_v = psx_bus_read32(cpu->bus, addr);
+        cpu->load_v = psx_bus_read32_fast(cpu->bus, addr);
     }
 }
 
@@ -764,7 +766,7 @@ static inline void psx_cpu_i_lwr(psx_cpu_t* cpu) {
     uint32_t t = cpu->r[rt];
 
     uint32_t addr = s + IMM16S;
-    uint32_t load = psx_bus_read32(cpu->bus, addr & 0xfffffffc);
+    uint32_t load = psx_bus_read32_fast(cpu->bus, addr & 0xfffffffc);
 
     if (rt == cpu->load_d) {
         t = cpu->load_v;
@@ -834,7 +836,7 @@ static inline void psx_cpu_i_swl(psx_cpu_t* cpu) {
 
     uint32_t addr = s + IMM16S;
     uint32_t aligned = addr & 0xfffffffc;
-    uint32_t v = psx_bus_read32(cpu->bus, aligned);
+    uint32_t v = psx_bus_read32_fast(cpu->bus, aligned);
 
     switch (addr & 0x3) {
         case 0: v = (v & 0xffffff00) | (cpu->r[T] >> 24); break;
@@ -878,7 +880,7 @@ static inline void psx_cpu_i_swr(psx_cpu_t* cpu) {
 
     uint32_t addr = s + IMM16S;
     uint32_t aligned = addr & 0xfffffffc;
-    uint32_t v = psx_bus_read32(cpu->bus, aligned);
+    uint32_t v = psx_bus_read32_fast(cpu->bus, aligned);
 
     switch (addr & 0x3) {
         case 0: v =                     cpu->r[T]       ; break;
@@ -1458,7 +1460,7 @@ static inline void psx_cpu_i_lwc2(psx_cpu_t* cpu) {
     if (addr & 0x3) {
         psx_cpu_exception(cpu, CAUSE_ADEL);
     } else {
-        gte_write_register(cpu, T, psx_bus_read32(cpu->bus, addr));
+        gte_write_register(cpu, T, psx_bus_read32_fast(cpu->bus, addr));
     }
 }
 
@@ -1783,6 +1785,7 @@ static inline void psx_gte_i_invalid(psx_cpu_t* cpu) {
     R_SXY1 = R_SXY2; \
     R_SX2 = gte_clamp_sxy(cpu, 1, (gte_clamp_mac0(cpu, (int64_t)((int32_t)R_OFX) + ((int64_t)R_IR1 * div)) >> 16)); \
     R_SY2 = gte_clamp_sxy(cpu, 2, (gte_clamp_mac0(cpu, (int64_t)((int32_t)R_OFY) + ((int64_t)R_IR2 * div)) >> 16)); \
+    if (g_psx_depth_capture) psx_depth_record(R_SXY2, R_H, R_SZ3); \
     R_MAC0 = gte_clamp_mac0(cpu, ((int64_t)R_DQB) + (((int64_t)R_DQA) * div)); \
     R_IR0 = gte_clamp_ir0(cpu, cpu->s_mac0 >> 12); }
 
@@ -1804,7 +1807,8 @@ static inline void psx_gte_i_invalid(psx_cpu_t* cpu) {
     R_SXY0 = R_SXY1; \
     R_SXY1 = R_SXY2; \
     R_SX2 = gte_clamp_sxy(cpu, 1, (gte_clamp_mac0(cpu, (int64_t)((int32_t)R_OFX) + ((int64_t)R_IR1 * div)) >> 16)); \
-    R_SY2 = gte_clamp_sxy(cpu, 2, (gte_clamp_mac0(cpu, (int64_t)((int32_t)R_OFY) + ((int64_t)R_IR2 * div)) >> 16)); }
+    R_SY2 = gte_clamp_sxy(cpu, 2, (gte_clamp_mac0(cpu, (int64_t)((int32_t)R_OFY) + ((int64_t)R_IR2 * div)) >> 16)); \
+    if (g_psx_depth_capture) psx_depth_record(R_SXY2, R_H, R_SZ3); }
 
 #define DPCT1 { \
     int64_t mac1 = gte_clamp_mac(cpu, 1, (((int64_t)R_RFC) << 12) - (((int64_t)cpu->cop2_dr.rgb[0].c[0]) << 16)); \

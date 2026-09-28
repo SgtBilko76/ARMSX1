@@ -75,6 +75,7 @@ typedef struct {
     int16_t x, y;
     uint32_t c;
     uint8_t tx, ty;
+    float w; /* stereo depth (psx/dev/depth.h); only read while psx_gpu_t.depth is set */
 } vertex_t;
 
 typedef struct {
@@ -174,6 +175,9 @@ struct psx_gpu_t {
 #ifdef USE_HARDWARE
     psx_gpu_renderer_t renderer;
 #endif
+
+    /* Stereo depth beside VRAM (1024x512, see psx/dev/depth.h). NULL unless enabled. */
+    float* depth;
 };
 
 static inline int psx_gpu_is_pal_mode(const psx_gpu_t* gpu) {
@@ -208,6 +212,8 @@ void psx_gpu_destroy(psx_gpu_t*);
 void psx_gpu_set_udata(psx_gpu_t*, int, void*);
 void psx_gpu_set_event_callback(psx_gpu_t*, int, psx_gpu_event_callback_t);
 void* psx_gpu_get_display_buffer(psx_gpu_t*);
+void psx_gpu_set_depth_enabled(psx_gpu_t*, int);
+const float* psx_gpu_get_display_depth(psx_gpu_t*);
 void psx_gpu_update(psx_gpu_t*, int);
 void gpu_render_triangle(psx_gpu_t*, vertex_t, vertex_t, vertex_t, poly_data_t, int);
 uint16_t gpu_fetch_texel(psx_gpu_t*, uint16_t, uint16_t, uint32_t, uint32_t, uint16_t, uint16_t, int);

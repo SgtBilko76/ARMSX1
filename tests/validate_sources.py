@@ -36,7 +36,9 @@ def main() -> int:
     require('"    execution_mode  = \\"cached\\"' in config, "generated settings do not default to cached")
     require('"cpu-engine"' in config, "--cpu-engine CLI selection is missing")
     require('"ARMSX_CPU_ENGINE"' in frontend, "ARMSX_CPU_ENGINE environment override is missing")
-    require("psx_bus_read32(cpu->bus, cpu->pc)" in cpu, "cached mode must preserve a real instruction bus fetch")
+    # psx_bus_read32_fast (psx/bus_init.h) is the same bus fetch with RAM/BIOS decoded inline.
+    require("psx_bus_read32(cpu->bus, cpu->pc)" in cpu or "psx_bus_read32_fast(cpu->bus, cpu->pc)" in cpu,
+            "cached mode must preserve a real instruction bus fetch")
     require("entry->opcode == cpu->opcode" in cpu, "cached mode lacks opcode verification")
     require("psx_cpu_invalidate_range" in cpu, "cached mode lacks targeted invalidation")
     require("pthread_" not in cpu and "SDL_CreateThread" not in cpu, "CPU engine must not depend on host threading")
