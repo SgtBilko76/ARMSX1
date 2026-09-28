@@ -17,6 +17,7 @@
 
 #include "psx/log.h"
 #include "psx/psx.h"
+#include "psx/savestate.h"
 #include "psx/dev/spu.h"
 #include "psx/dev/cdrom/cdrom.h"
 
@@ -133,6 +134,47 @@ int main(int argc, char** argv) {
             "voices=%llu vol_negative=%llu vol_sweep=%llu mainvol_top_bits=%u/%u/%u/%u\n",
             spu_samples, spu_clipped, mix_wrapped, loud, cd_nonzero, voice_checks, vol_negative, vol_sweep,
             main_vol_seen[0], main_vol_seen[1], main_vol_seen[2], main_vol_seen[3]);
+    }
+
+    /* FRAME_HASH_STATE=<path>: save state test. Saves at frame `frames`, runs 300 more frames
+       and hashes, then loads the state back -- into this machine and into a freshly booted one --
+       runs the same 300 frames, and requires identical hashes. */
+    const char* state_path = getenv("FRAME_HASH_STATE");
+    if (state_path && state_path[0]) {
+        uint64_t hashes[3];
+        if (psx_state_save(psx, state_path)) {
+            fprintf(stderr, "FRAME_HASH state failed reason=save\n");
+            return 1;
+        }
+        for (int pass = 0; pass < 3; pass++) {
+            psx_t* target = psx;
+            if (pass == 2) {
+                target = psx_create();
+                if (!target || psx_init(target, argv[1], NULL) != 0 ||
+                    (strcmp(argv[2], "-") && !psx_cdrom_open(psx_get_cdrom(target), argv[2]))) {
+                    fprintf(stderr, "FRAME_HASH state failed reason=fresh-init\n");
+                    return 1;
+                }
+                for (int f = 0; f < 60; f++)
+                    psx_run_frame(target); /* some unrelated state to overwrite */
+            }
+            if (pass > 0 && psx_state_load(target, state_path)) {
+                fprintf(stderr, "FRAME_HASH state failed reason=load pass=%d\n", pass);
+                return 1;
+            }
+            for (int f = 0; f < 300; f++)
+                psx_run_frame(target);
+            uint64_t hash = 0xcbf29ce484222325ull;
+            hash = fnv1a(hash, psx_get_ram(target)->buf, psx_get_ram(target)->size);
+            hash = fnv1a(hash, psx_get_vram(target), PSX_GPU_VRAM_SIZE);
+            hash = fnv1a(hash, target->cpu, offsetof(psx_cpu_t, bus));
+            hashes[pass] = hash;
+            printf("FRAME_HASH state pass=%d hash=%016llx\n", pass, (unsigned long long)hash);
+        }
+        const int ok = hashes[0] == hashes[1] && hashes[0] == hashes[2];
+        printf("FRAME_HASH state %s\n", ok ? "IDENTICAL" : "MISMATCH");
+        if (!ok)
+            return 1;
     }
 
     const double seconds = (double)(clock() - start) / CLOCKS_PER_SEC;

@@ -13,6 +13,7 @@ ARMSX1 currently has the following emulator pieces wired up:
 - fast forward
 - protocol/file launch through `armsx:///...` on supported hosts
 - the FSUI settings shell
+- save states: five slots per game from the pause menu (**Save State** / **Load State**), stored under `states/` in the app folder. A state restores the whole machine except the memory cards, whose saves stay as they are; it loads only in the same build on the same kind of device.
 
 Disc image support is:
 - `BIN/CUE`
@@ -186,6 +187,8 @@ Run the deterministic source and subsystem matrix:
 ```sh
 python3 tests/run_validation.py
 ```
+
+`make frame-hash BIOS=... IMAGE=... FRAMES=1800` boots a disc headless and prints RAM/VRAM/CPU hashes, for checking that a core change leaves emulation bit-identical; with `FRAME_HASH_STATE=/tmp/x.state` it also saves a state, and requires that loading it (into the same and into a freshly booted machine) continues identically.
 
 The cases cover source invariants, cached/reference CPU differential execution and self-modifying code, GPU VRAM parity, CHD layout/subchannel logic, ZIP extraction and traversal rejection, and browser file-selection rules. `make disc-probe IMAGE=/path/to/game.cue` performs a read-only disc-open and sector-read smoke test.
 

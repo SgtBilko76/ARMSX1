@@ -71,6 +71,7 @@ extern "C" {
 #include "../psx/dev/pad.h"
 #include "../psx/dev/timer.h"
 #include "../psx/input/sda.h"
+#include "../psx/savestate.h"
 #include "common.h"
 #include "config.h"
 #include "toml.h"
@@ -2537,6 +2538,32 @@ class ArmsxSession {
         if (!enabled) {
             stereo_ready_ = false;
         }
+    }
+
+    // Save states (psx/savestate.c). The file name is derived from the running game.
+    std::string stateKey() const {
+        const std::filesystem::path source = disc_path_.empty() ? exe_path_ : disc_path_;
+        return source.empty() ? std::string("bios") : source.stem().string();
+    }
+
+    bool saveState(const std::filesystem::path& path) {
+        if (!psx_) {
+            return false;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+        return psx_state_save(psx_, path.string().c_str()) == 0;
+    }
+
+    bool loadState(const std::filesystem::path& path) {
+        if (!psx_ || psx_state_load(psx_, path.string().c_str()) != 0) {
+            return false;
+        }
+        // Nothing queued from before belongs to the restored moment.
+        clearQueuedAudio();
+        texture_snapshot_.clear();
+        stereo_ready_ = false;
+        return true;
     }
 
     // True when the latest frame has two eye images (a 3D game frame, not FMV or a 2D screen).
@@ -5285,6 +5312,12 @@ class ArmsxApp {
             }
         }
 
+        if (deferred_state_action_.has_value()) {
+            const StateAction action = *deferred_state_action_;
+            deferred_state_action_.reset();
+            applyStateAction(action);
+        }
+
         if (deferred_screenshot_) {
             deferred_screenshot_ = false;
 
@@ -5352,6 +5385,78 @@ class ArmsxApp {
         session_.destroy();
         resetFramePacing("exit-to-library");
         showLandingWindow();
+    }
+
+    struct StateAction {
+        bool saving = false;
+        int slot = 1;
+    };
+    static constexpr int kStateSlots = 5;
+
+    std::filesystem::path statePath(int slot) const {
+        return DefaultBrowseDirectory() / "states" / (session_.stateKey() + ".slot" + std::to_string(slot) + ".state");
+    }
+
+    void openStateSlotDialog(bool saving) {
+        if (!session_.valid()) {
+            return;
+        }
+        ImGuiFullscreen::ChoiceDialogOptions options;
+        for (int slot = 1; slot <= kStateSlots; slot++) {
+            std::error_code ec;
+            const std::filesystem::path path = statePath(slot);
+            std::string label = "Slot " + std::to_string(slot) + "  -  ";
+            if (std::filesystem::exists(path, ec)) {
+                const std::time_t when = FileTimeToTimeT(std::filesystem::last_write_time(path, ec));
+                char stamp[64] = {};
+                std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M", std::localtime(&when));
+                label += stamp;
+            } else {
+                label += "empty";
+            }
+            options.emplace_back(label, false);
+        }
+        ImGuiFullscreen::OpenChoiceDialog(
+            saving ? ICON_FA_SAVE " Save State" : ICON_FA_FOLDER_OPEN " Load State",
+            false,
+            std::move(options),
+            [this, saving](int index, const std::string&, bool) {
+                // Closing destroys this very callback: copy what it captured first.
+                ArmsxApp* const app = this;
+                const bool is_saving = saving;
+                ImGuiFullscreen::CloseChoiceDialog();
+                if (index < 0 || index >= kStateSlots) {
+                    return;
+                }
+                // Applied between frames, like every other change to the running machine.
+                app->deferred_state_action_ = StateAction{is_saving, index + 1};
+            });
+    }
+
+    void applyStateAction(const StateAction& action) {
+        if (!session_.valid()) {
+            return;
+        }
+        const std::filesystem::path path = statePath(action.slot);
+        if (action.saving) {
+            if (!session_.saveState(path)) {
+                pending_error_dialog_ = "Could not save the state to " + path.string() + ".";
+            }
+            return;
+        }
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) {
+            pending_error_dialog_ = "Slot " + std::to_string(action.slot) + " is empty.";
+            return;
+        }
+        if (!session_.loadState(path)) {
+            pending_error_dialog_ = "Could not load this state. States only load in the build and on the kind of device that saved them.";
+            return;
+        }
+        // Straight back into the game at the restored moment.
+        returnToMainWindow();
+        session_.setPaused(false);
+        resetFramePacing("load-state");
     }
 
     void openPauseMenu() {
@@ -5758,6 +5863,20 @@ class ArmsxApp {
             );
         };
         items.push_back(std::move(change_disc));
+
+        fsui::MenuItemDescriptor save_state;
+        save_state.id = "save-state";
+        save_state.title = ICON_FA_SAVE " Save State";
+        save_state.summary = "Save a snapshot of the game right now into one of five slots.";
+        save_state.on_activate = [this]() { openStateSlotDialog(true); };
+        items.push_back(std::move(save_state));
+
+        fsui::MenuItemDescriptor load_state;
+        load_state.id = "load-state";
+        load_state.title = ICON_FA_FOLDER_OPEN " Load State";
+        load_state.summary = "Continue from a snapshot saved earlier.";
+        load_state.on_activate = [this]() { openStateSlotDialog(false); };
+        items.push_back(std::move(load_state));
 
         fsui::MenuItemDescriptor screenshot;
         screenshot.id = "screenshot";
@@ -7154,6 +7273,7 @@ class ArmsxApp {
     std::optional<LaunchRequest> deferred_launch_{};
     std::optional<std::filesystem::path> deferred_change_disc_{};
     std::optional<bool> deferred_vsync_{};
+    std::optional<StateAction> deferred_state_action_{};
     std::optional<std::string> pending_settings_page_restore_{};
     std::optional<LaunchRequest> pending_cli_launch_{};
     std::string pending_cli_argument_;

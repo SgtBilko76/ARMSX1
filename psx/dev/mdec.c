@@ -183,6 +183,7 @@ void mdec_decode_macroblock(psx_mdec_t* mdec) {
         size_t size = block_size;
 
         mdec->output = malloc(size);
+        mdec->output_size = size;
 
         rl_decode_block(mdec->yblk, (uint16_t*)mdec->input, mdec->y_quant_table, mdec->scale_table);
 
@@ -213,8 +214,10 @@ void mdec_decode_macroblock(psx_mdec_t* mdec) {
         while (bytes_processed < mdec->input_size) {
             if (!mdec->output) {
                 mdec->output = malloc(block_count * size);
+                mdec->output_size = block_count * size;
             } else {
                 mdec->output = realloc(mdec->output, block_count * size);
+                mdec->output_size = block_count * size;
             }
 
             in = rl_decode_block(mdec->crblk, in, mdec->uv_quant_table, mdec->scale_table);
@@ -365,6 +368,7 @@ void psx_mdec_write32(psx_mdec_t* mdec, uint32_t offset, uint32_t value) {
                     g_mdec_cmd_table[mdec->cmd >> 29](mdec);
 
                     free(mdec->input);
+                    mdec->input = NULL;
                 }
 
                 break;

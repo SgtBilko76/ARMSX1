@@ -57,6 +57,7 @@ typedef struct {
 
     uint8_t* output;
     int output_index;
+    size_t output_size; /* bytes allocated at output (for save states) */
     uint32_t output_words_remaining;
 
     uint32_t words_remaining;
