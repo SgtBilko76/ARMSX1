@@ -170,6 +170,9 @@ ifeq ($(USE_CHD),1)
 endif
 
 BASE_CXXFLAGS = -std=c++20 $(BASE_CFLAGS) $(FSUI_INCLUDE_FLAGS) $(FSUI_COMPILE_DEFS)
+# Quest VR mode (frontend/vr). Headers only: the loader is dlopen'ed on Android, and every other
+# platform compiles inert stubs.
+BASE_CXXFLAGS += -Ithird_party/openxr/include
 BASE_CFLAGS += $(LIBCHDR_INCLUDE_FLAGS) $(CHD_COMPILE_DEFS)
 BASE_CXXFLAGS += $(LIBCHDR_INCLUDE_FLAGS) $(CHD_COMPILE_DEFS)
 
@@ -289,7 +292,7 @@ C_SOURCES += frontend/vita_sdl_stubs.c
 endif
 C_SOURCES_SHARED := $(C_SOURCES)
 
-CPP_SOURCES := frontend/archive.cpp frontend/main.cpp
+CPP_SOURCES := frontend/archive.cpp frontend/main.cpp frontend/vr/vr_openxr.cpp
 
 FSUI_LIBS := \
 	$(FSUI_BUILD_DIR)/libfsui-donor.a \
@@ -360,7 +363,7 @@ endif
 SDL_LIBS := $(if $(filter 1,$(SDL_STATIC)),$(SDL_LIBS_STATIC),$(SDL_LIBS_DYNAMIC))
 SDL_LIBS_SHARED := $(SDL_LIBS_DYNAMIC)
 
-.PHONY: all clean shared wasm psvita-lib test test-cpu test-gpu test-audio test-sdl-audio test-chd test-zip test-sdl-runtime disc-probe
+.PHONY: all clean shared wasm psvita-lib test test-cpu test-gpu test-audio test-sdl-audio test-chd test-zip test-vr test-sdl-runtime disc-probe frame-hash
 
 all: $(BIN)
 
@@ -382,6 +385,7 @@ TEST_SDL_AUDIO_BIN := build/tests/sdl_audio_queue_smoke
 TEST_CHD_BIN := build/tests/chd_logic
 TEST_ZIP_BIN := build/tests/zip_integration
 TEST_SDL_BIN := build/tests/sdl_renderer_smoke
+TEST_VR_BIN := build/tests/quest_vr_logic
 DISC_PROBE_BIN := build/tests/disc_probe
 TEST_PLATFORM_FILE_OBJ := build/tests/platform_file.o
 
@@ -396,12 +400,19 @@ $(TEST_CPU_BIN): tests/cpu_differential.c $(TEST_CORE_SOURCES) $(TEST_PLATFORM_F
 test-cpu: $(TEST_CPU_BIN)
 	./$(TEST_CPU_BIN)
 
-$(TEST_GPU_BIN): tests/gpu_renderer_parity.c psx/dev/gpu.c frontend/gpu_hw.c
+$(TEST_GPU_BIN): tests/gpu_renderer_parity.c psx/dev/gpu.c psx/dev/depth.c frontend/gpu_hw.c
 	mkdir -p $(dir $@)
 	$(CC) -std=c11 -O2 -g -DUSE_HARDWARE -DPSXE_DIAG_STDIO_DISABLE -I. -Ipsx $(SDL_CFLAGS) $^ -lm -o $@
 
 test-gpu: $(TEST_GPU_BIN)
 	./$(TEST_GPU_BIN)
+
+$(TEST_VR_BIN): tests/quest_vr_logic_test.cpp frontend/vr/quest_pad_mapper.h frontend/vr/screen_geometry.h frontend/vr/stereo_reproject.h
+	mkdir -p $(dir $@)
+	$(CXX) -std=c++20 -O2 -g -Wall -Wextra -I. $< -o $@
+
+test-vr: $(TEST_VR_BIN)
+	./$(TEST_VR_BIN)
 
 $(TEST_AUDIO_BIN): tests/audio_timing.c
 	mkdir -p $(dir $@)
@@ -446,6 +457,17 @@ $(DISC_PROBE_BIN): tests/disc_probe.c psx/dev/cdrom/disc.c psx/dev/cdrom/cue.c p
 		$(CHD_LINK_LIBS) -lm -o $@
 
 disc-probe: $(DISC_PROBE_BIN)
+
+# Determinism and speed probe for core changes (tests/frame_hash.c). Needs a BIOS and a disc, so
+# it is not part of the validation matrix. Same optimisation flags as the app build.
+FRAME_HASH_BIN := build/tests/frame_hash
+FRAMES ?= 1800
+$(FRAME_HASH_BIN): tests/frame_hash.c $(TEST_CORE_SOURCES) $(TEST_PLATFORM_FILE_OBJ)
+	mkdir -p $(dir $@)
+	$(CC) -std=gnu11 -O3 -ffast-math -g -DPSXE_DIAG_STDIO_DISABLE -I. -Ipsx $^ -lm -o $@
+
+frame-hash: $(FRAME_HASH_BIN)
+	./$(FRAME_HASH_BIN) "$(BIOS)" "$(IMAGE)" $(FRAMES)
 
 test:
 	python3 tests/run_validation.py

@@ -329,7 +329,7 @@ elif [ "$MODE" = "android" ]; then
     export RANLIB
 
     SDL_CFLAGS="-D_REENTRANT -DANDROID -D__BIONIC_NO_PAGE_SIZE_MACRO -I${SDL_INCLUDE_PATH}"
-    SDL_LIBS="-L${SDL_LIB_PATH} -lSDL2 -llog -landroid -lGLESv3 -lEGL -lOpenSLES -lm -lc++_shared"
+    SDL_LIBS="-L${SDL_LIB_PATH} -lSDL2 -llog -landroid -lGLESv3 -lEGL -lOpenSLES -ldl -lm -lc++_shared"
     ANDROID_FLEXIBLE_PAGE_LDFLAGS="-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384"
 
     FSUI_BUILD_ROOT="${REPO_ROOT}/build/fsui/android/${ANDROID_ABI}"

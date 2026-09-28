@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cctype>
+#include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,7 +58,9 @@
 #endif
 
 #if defined(__ANDROID__)
+#include <android/log.h>
 #include <jni.h>
+#include <sys/system_properties.h>
 #endif
 
 extern "C" {
@@ -83,6 +86,10 @@ extern "C" {
 #include "fsui/fsui.hpp"
 #include "fsui/imgui_fullscreen.hpp"
 #include "imgui.h"
+#include "imgui_impl_sdlrenderer2.h"
+#include "vr/parallel_for.h"
+#include "vr/stereo_reproject.h"
+#include "vr/vr_host.h"
 
 #undef main
 
@@ -547,6 +554,9 @@ struct FrontendSettings {
     int upscale_height = 480;
     int presentation_upscale = 1;
     bool mobile_controls = DefaultMobileControlsEnabled();
+    armsx::vr::ScreenConfig vr_screen{};
+    int vr_depth_percent = 100; // stereoscopic 3D strength; 0 is flat
+    int vr_popout = 2;          // stereo convergence: what sits on the screen plane
     fsui::UiState ui_state{
         .theme = "Dark",
         .prompt_icon_pack = fsui::PromptIconPack::Auto,
@@ -1656,6 +1666,30 @@ void LoadExtraSettings(FrontendSettings& settings, const CliFlags& cli) {
         CopyTomlArrayStrings(toml_array_in(library, "recursive_folders"), settings.ui_state.game_list_recursive_paths);
     }
 
+    if (toml_table_t* vr = toml_table_in(root, "vr")) {
+        // Centimetres, like the FSUI choices that set them.
+        toml_datum_t width_cm = toml_int_in(vr, "screen_width_cm");
+        toml_datum_t distance_cm = toml_int_in(vr, "screen_distance_cm");
+        toml_datum_t curved = toml_bool_in(vr, "curved");
+        if (width_cm.ok) {
+            settings.vr_screen.width_m = std::clamp(static_cast<float>(width_cm.u.i) / 100.0f, 0.5f, 8.0f);
+        }
+        if (distance_cm.ok) {
+            settings.vr_screen.distance_m = std::clamp(static_cast<float>(distance_cm.u.i) / 100.0f, 0.5f, 6.0f);
+        }
+        if (curved.ok) {
+            settings.vr_screen.curved = curved.u.b != 0;
+        }
+        toml_datum_t depth = toml_int_in(vr, "depth_3d_percent");
+        toml_datum_t popout = toml_int_in(vr, "popout");
+        if (depth.ok) {
+            settings.vr_depth_percent = std::clamp(static_cast<int>(depth.u.i), 0, 200);
+        }
+        if (popout.ok) {
+            settings.vr_popout = std::clamp(static_cast<int>(popout.u.i), 1, 16);
+        }
+    }
+
     if (toml_table_t* fsui_state = toml_table_in(root, "fsui")) {
         toml_datum_t default_view = toml_int_in(fsui_state, "default_game_view");
         toml_datum_t sort = toml_int_in(fsui_state, "game_sort");
@@ -1817,6 +1851,12 @@ bool SaveSettings(const FrontendSettings& settings) {
         << "    wide_upscale = \"" << UpscaleToString(settings.upscale_height) << "\"\n\n"
         << "[input]\n"
         << "    mobile_controls = " << (settings.mobile_controls ? "true" : "false") << "\n\n"
+        << "[vr]\n"
+        << "    screen_width_cm = " << std::lround(settings.vr_screen.width_m * 100.0f) << "\n"
+        << "    screen_distance_cm = " << std::lround(settings.vr_screen.distance_m * 100.0f) << "\n"
+        << "    curved = " << (settings.vr_screen.curved ? "true" : "false") << "\n"
+        << "    depth_3d_percent = " << settings.vr_depth_percent << "\n"
+        << "    popout = " << settings.vr_popout << "\n\n"
         << "[library]\n"
         << "    folders = ";
     write_path_array(settings.ui_state.game_list_paths);
@@ -1930,6 +1970,7 @@ class ArmsxSession {
 
         psx_cpu_set_execution_mode(psx_get_cpu(psx_), settings.cpu_engine);
         psxe_diag_logf("cpu", "execution engine=%s", CpuEngineSettingToken(settings.cpu_engine));
+        psx_set_stereo_depth(psx_, stereo_enabled_ ? 1 : 0);
 
         psx_gpu_t* gpu = psx_get_gpu(psx_);
         psx_gpu_set_event_callback(gpu, GPU_EVENT_DMODE, nullptr);
@@ -2111,6 +2152,7 @@ class ArmsxSession {
         }
         destroyPresentationTexture();
         texture_snapshot_.clear();
+        destroyStereoTexture();
 
 #ifdef USE_HARDWARE
         if (hw_renderer_) {
@@ -2209,6 +2251,19 @@ class ArmsxSession {
         if (audio_dev_) {
             updateAudioPlaybackState();
         }
+    }
+
+    // For the VR performance probe: how much audio is waiting, and how often it ran dry.
+    double queuedAudioMs() const {
+        if (!audio_dev_ || !audio_playback_started_) {
+            return -1.0;
+        }
+        return static_cast<double>(SDL_GetQueuedAudioSize(audio_dev_)) * 1000.0 /
+            static_cast<double>(kAudioMixRate * kAudioBytesPerSampleFrame);
+    }
+
+    std::uint64_t audioUnderruns() const {
+        return audio_underruns_;
     }
 
     bool fastForwardEnabled() const {
@@ -2457,6 +2512,32 @@ class ArmsxSession {
         }
 
         updatePresentationTexture(settings);
+        updateStereoFrame(settings, use_vram_source ? nullptr : static_cast<const uint16_t*>(display_buffer));
+    }
+
+    // VR stereoscopic 3D (see frontend/vr/stereo_reproject.h). Depth capture in the core follows
+    // `enabled`; the rest only shapes the parallax. Takes effect on the next emulated frame.
+    void setStereo(bool enabled, float strength, float convergence, float screen_width_m) {
+        stereo_enabled_ = enabled;
+        stereo_strength_ = strength;
+        stereo_convergence_ = convergence;
+        stereo_screen_width_m_ = screen_width_m;
+        if (psx_) {
+            psx_set_stereo_depth(psx_, enabled ? 1 : 0);
+        }
+        if (!enabled) {
+            stereo_ready_ = false;
+        }
+    }
+
+    // True when the latest frame has two eye images (a 3D game frame, not FMV or a 2D screen).
+    bool stereoReady() const {
+        return stereo_ready_ && stereo_texture_[0] && stereo_texture_[1];
+    }
+
+    // draw() places the left eye's texture; rendering the right eye swaps in this one.
+    SDL_Texture* stereoTexture(int eye) const {
+        return stereo_texture_[eye == 0 ? 0 : 1];
     }
 
     void draw(const FrontendSettings& settings) {
@@ -2526,7 +2607,8 @@ class ArmsxSession {
         );
 #endif
         draw_list->AddRectFilled(ImVec2(0.0f, 0.0f), display, IM_COL32(0, 0, 0, 255));
-        SDL_Texture* presentation = presentation_texture_ ? presentation_texture_ : texture_;
+        stereo_image_fraction_ = target_width / display_width;
+        SDL_Texture* presentation = stereoReady() ? stereo_texture_[0] : (presentation_texture_ ? presentation_texture_ : texture_);
         draw_list->AddImage(
             reinterpret_cast<ImTextureID>(presentation),
             ImVec2(offset_x, offset_y),
@@ -2674,6 +2756,112 @@ class ArmsxSession {
     }
 
   private:
+    void destroyStereoTexture() {
+        for (SDL_Texture*& texture : stereo_texture_) {
+            if (texture) {
+                SDL_DestroyTexture(texture);
+                texture = nullptr;
+            }
+        }
+        stereo_width_ = 0;
+        stereo_height_ = 0;
+        stereo_ready_ = false;
+    }
+
+    void updateStereoFrame(const FrontendSettings& settings, const uint16_t* color) {
+        stereo_ready_ = false;
+        const float* depth = psx_ ? psx_get_display_depth(psx_) : nullptr;
+        // 24-bit frames are FMV, which has no depth; the debug view is VRAM itself.
+        if (!stereo_enabled_ || debug_view_ || !color || !depth || texture_format_ != SDL_PIXELFORMAT_BGR555 ||
+            stereo_image_fraction_ <= 0.0f) {
+            return;
+        }
+
+        armsx::vr::StereoParams params;
+        params.max_disparity_px = armsx::vr::MaxDisparityPx(
+            stereo_strength_, stereo_screen_width_m_ * stereo_image_fraction_, texture_width_);
+        params.convergence = stereo_convergence_;
+        if (params.max_disparity_px <= 0.0f) {
+            return;
+        }
+
+        const int width = texture_width_ * params.scale;
+        const int height = texture_height_;
+        if (!stereo_texture_[0] || stereo_width_ != width || stereo_height_ != height) {
+            destroyStereoTexture();
+            // RGBA, the GLES renderer's native format: SDL uploads it as is. (BGR555 like the mono
+            // texture would be converted pixel by pixel on the CPU at every upload.)
+            for (SDL_Texture*& texture : stereo_texture_) {
+                texture = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, width, height);
+                if (!texture) {
+                    destroyStereoTexture();
+                    return;
+                }
+            }
+            stereo_width_ = width;
+            stereo_height_ = height;
+        }
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+        for (SDL_Texture* texture : stereo_texture_) {
+            SDL_SetTextureScaleMode(texture, settings.texture_scale_mode ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+        }
+#else
+        (void)settings;
+#endif
+
+        // Both eyes, each in row bands, spread over idle cores: this runs on the emulator's own
+        // thread between frames, where every millisecond is taken from the game.
+        const std::array<uint32_t, 0x8000>& to_rgba = Bgr555ToRgbaTable();
+        constexpr int kRowStride = PSX_GPU_FB_STRIDE / static_cast<int>(sizeof(uint16_t));
+        for (std::vector<uint32_t>& pixels : stereo_pixels_) {
+            pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
+        }
+        if (!stereo_workers_) {
+            stereo_workers_ = std::make_unique<armsx::vr::ParallelFor>(kStereoTasks - 1);
+        }
+        const int band = (height + kStereoBands - 1) / kStereoBands;
+        stereo_workers_->Run(kStereoTasks, [&](int task) {
+            const int eye = task / kStereoBands;
+            const int first_row = (task % kStereoBands) * band;
+            const int last_row = std::min(height, first_row + band);
+            std::vector<uint16_t>& row = stereo_rows_[task];
+            row.resize(static_cast<size_t>(width));
+            for (int y = first_row; y < last_row; y++) {
+                stereo_reprojectors_[task].ReprojectRow(
+                    color + y * kRowStride,
+                    depth + y * kRowStride,
+                    texture_width_,
+                    eye == 0 ? -1 : 1,
+                    params,
+                    row.data());
+                uint32_t* out = stereo_pixels_[eye].data() + static_cast<size_t>(y) * static_cast<size_t>(width);
+                for (int x = 0; x < width; x++) {
+                    out[x] = to_rgba[row[static_cast<size_t>(x)] & 0x7fff];
+                }
+            }
+        });
+        for (int eye = 0; eye < 2; eye++) {
+            SDL_UpdateTexture(stereo_texture_[eye], nullptr, stereo_pixels_[eye].data(), width * static_cast<int>(sizeof(uint32_t)));
+        }
+        stereo_ready_ = true;
+    }
+
+    // BGR555 -> RGBA bytes, expanding 5 bits to 8 the way SDL does (floor(v * 255 / 31)), so the
+    // 3D image matches the mono one exactly.
+    static const std::array<uint32_t, 0x8000>& Bgr555ToRgbaTable() {
+        static const std::array<uint32_t, 0x8000> table = [] {
+            std::array<uint32_t, 0x8000> t{};
+            for (uint32_t v = 0; v < 0x8000; v++) {
+                const uint32_t r = ((v >> 0) & 0x1f) * 255 / 31;
+                const uint32_t g = ((v >> 5) & 0x1f) * 255 / 31;
+                const uint32_t b = ((v >> 10) & 0x1f) * 255 / 31;
+                t[v] = r | (g << 8) | (b << 16) | 0xff000000u;
+            }
+            return t;
+        }();
+        return table;
+    }
+
     void destroyPresentationTexture() {
         if (presentation_texture_) {
             SDL_DestroyTexture(presentation_texture_);
@@ -2844,6 +3032,9 @@ class ArmsxSession {
         MixPsxAudio(psx_, frame_audio.data(), static_cast<int>(frame_audio.size()));
 
         size_t queue_before = static_cast<size_t>(SDL_GetQueuedAudioSize(audio_dev_));
+        if (audio_playback_started_ && queue_before == 0) {
+            audio_underruns_++;
+        }
         if (queue_before > kMaxQueuedAudioBytes) {
             SDL_PauseAudioDevice(audio_dev_, 1);
             SDL_ClearQueuedAudio(audio_dev_);
@@ -2915,12 +3106,28 @@ class ArmsxSession {
     SDL_Texture* texture_ = nullptr;
     SDL_Texture* presentation_texture_ = nullptr;
     std::vector<uint8_t> texture_snapshot_;
+    bool stereo_enabled_ = false;
+    bool stereo_ready_ = false;
+    float stereo_strength_ = 1.0f;
+    float stereo_convergence_ = 2.0f;
+    float stereo_screen_width_m_ = 2.4f;
+    float stereo_image_fraction_ = 0.0f;
+    SDL_Texture* stereo_texture_[2] = {nullptr, nullptr};
+    int stereo_width_ = 0;
+    int stereo_height_ = 0;
+    std::vector<uint32_t> stereo_pixels_[2];
+    static constexpr int kStereoBands = 2;
+    static constexpr int kStereoTasks = 2 * kStereoBands;
+    std::vector<uint16_t> stereo_rows_[kStereoTasks];
+    armsx::vr::StereoReprojector stereo_reprojectors_[kStereoTasks];
+    std::unique_ptr<armsx::vr::ParallelFor> stereo_workers_;
 #ifdef USE_HARDWARE
     armsx_hw_renderer_t* hw_renderer_ = nullptr;
 #endif
     SDL_AudioDeviceID audio_dev_ = 0;
     double audio_sample_accumulator_ = 0.0;
     bool audio_playback_started_ = false;
+    std::uint64_t audio_underruns_ = 0;
     std::filesystem::path disc_path_;
     std::filesystem::path exe_path_;
     std::string title_;
@@ -2997,6 +3204,30 @@ class GameplayInputRouter {
 
     uint32_t activeDigitalMask() const {
         return active_digital_mask_;
+    }
+
+    // Quest Touch controllers, already mapped to the pad (armsx::vr::QuestPadMapper). Ignored while
+    // FSUI owns input, like every other source.
+    void setVrPad(uint32_t mask, const std::array<uint8_t, 4>& analog) {
+        if (fsui_owns_input_) {
+            mask = 0;
+        }
+        if (vr_digital_mask_ != mask) {
+            vr_digital_mask_ = mask;
+            syncDigitalMask();
+        }
+        if (!pad_ || fsui_owns_input_ || analog == vr_analog_) {
+            return;
+        }
+        static constexpr std::array<uint32_t, 4> axes = {
+            PSXI_AX_SDA_LEFT_HORZ, PSXI_AX_SDA_LEFT_VERT, PSXI_AX_SDA_RIGHT_HORZ, PSXI_AX_SDA_RIGHT_VERT,
+        };
+        for (size_t i = 0; i < axes.size(); i++) {
+            if (analog[i] != vr_analog_[i]) {
+                psx_pad_analog_change(pad_, 0, axes[i], analog[i]);
+            }
+        }
+        vr_analog_ = analog;
     }
 
     void tick(bool fsui_active) {
@@ -3256,7 +3487,7 @@ class GameplayInputRouter {
     }
 
     void syncDigitalMask() {
-        const uint32_t desired_mask = physical_digital_mask_ | virtual_digital_mask_;
+        const uint32_t desired_mask = physical_digital_mask_ | virtual_digital_mask_ | vr_digital_mask_;
         if (!pad_) {
             active_digital_mask_ = desired_mask;
             return;
@@ -3274,6 +3505,8 @@ class GameplayInputRouter {
     }
 
     void clearAll() {
+        vr_digital_mask_ = 0;
+        vr_analog_ = {0x80, 0x80, 0x80, 0x80};
         if (!pad_) {
             physical_digital_mask_ = 0;
             virtual_digital_mask_ = 0;
@@ -3365,6 +3598,8 @@ class GameplayInputRouter {
     SDL_GameController* controller_ = nullptr;
     uint32_t physical_digital_mask_ = 0;
     uint32_t virtual_digital_mask_ = 0;
+    uint32_t vr_digital_mask_ = 0;
+    std::array<uint8_t, 4> vr_analog_ = {0x80, 0x80, 0x80, 0x80};
     uint32_t active_digital_mask_ = 0;
     PendingChordButton start_button_{};
     PendingChordButton select_button_{};
@@ -3759,6 +3994,13 @@ class ArmsxApp {
 
         installCrashHandlers();
 
+        vr_mode_ = !external_window_ && !external_renderer_ && armsx::vr::Requested();
+        if (vr_mode_) {
+            // No touchscreen in a headset: the Touch controllers drive the pad and the UI.
+            settings_.mobile_controls = false;
+            psxe_diag_logf("vr", "Quest VR mode requested");
+        }
+
         if (!initializeSdl() || !initializeWindowAndRenderer() || !initializeFsui()) {
             shutdown();
             return 1;
@@ -3926,6 +4168,11 @@ class ArmsxApp {
     }
 
     Uint32 managedRendererFlags(bool vsync_enabled) const {
+        if (vr_mode_) {
+            // Frames go to the headset through an offscreen texture, so there is no window present
+            // to synchronize, and the XR copy needs a GL renderer.
+            return SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE;
+        }
         Uint32 renderer_flags = settings_.gpu_backend == GpuBackend::SDLAccelerated
             ? SDL_RENDERER_ACCELERATED
             : SDL_RENDERER_SOFTWARE;
@@ -3939,7 +4186,7 @@ class ArmsxApp {
 
 #ifdef USE_HARDWARE
     bool hardwareRendererAvailable() const {
-        if (!owns_renderer_ || external_renderer_ || !renderer_) {
+        if (!owns_renderer_ || external_renderer_ || !renderer_ || vr_mode_) {
             return false;
         }
         return SupportsHardwareGpuBackend();
@@ -4012,6 +4259,17 @@ class ArmsxApp {
                 .path = DefaultBrowseDirectory().string(),
             },
         };
+#if defined(__ANDROID__)
+        if (vr_mode_) {
+            // The Quest build holds all-files access, so shared storage -- where files copied onto
+            // the headset over USB land -- is browsable directly.
+            const char* external = std::getenv("EXTERNAL_STORAGE");
+            roots.push_back(ImGuiFullscreen::FileSelectorRootEntry{
+                .title = "Internal Storage",
+                .path = (external && external[0]) ? external : "/storage/emulated/0",
+            });
+        }
+#endif
 
         ImGuiFullscreen::SetFileSelectorExtraRoots(std::move(roots));
     }
@@ -4078,7 +4336,8 @@ class ArmsxApp {
     }
 
     bool recreateManagedRenderer(bool desired_vsync) {
-        if (!owns_renderer_ || external_renderer_ || !window_) {
+        // The XR thread's GL context shares SDL's; a new renderer would leave it behind.
+        if (!owns_renderer_ || external_renderer_ || !window_ || vr_mode_) {
             return false;
         }
 
@@ -4199,6 +4458,27 @@ class ArmsxApp {
         return kUiFrameRate;
     }
 
+    // In VR, the frame rate is nudged by at most +-0.5% so the queued audio stays near
+    // kVrAudioTargetMs. Emulation is timed by the CPU clock and playback by the audio hardware's,
+    // and the two drift apart: without this the queue slowly runs dry (clicks as SDL pads with
+    // silence) or overfills (and is flushed). Android pulls audio in ~23 ms chunks, so the target
+    // keeps well clear of that.
+    double pacedFrameRate() const {
+        const double rate = currentTargetFrameRate();
+        if (!vr_mode_ || !session_.valid() || session_.paused() || session_.fastForwardEnabled()) {
+            return rate;
+        }
+        const double queued_ms = session_.queuedAudioMs();
+        if (queued_ms < 0.0) {
+            return rate;
+        }
+        const double error = std::clamp((queued_ms - kVrAudioTargetMs) / kVrAudioTargetMs, -1.0, 1.0);
+        return rate * (1.0 - error * kVrAudioMaxRateAdjust);
+    }
+
+    static constexpr double kVrAudioTargetMs = 60.0;
+    static constexpr double kVrAudioMaxRateAdjust = 0.005;
+
     void updateFramePeriod(double frame_rate) {
 #if !defined(__EMSCRIPTEN__)
         const double safe_rate = std::max(frame_rate, 1.0);
@@ -4208,7 +4488,14 @@ class ArmsxApp {
             static_cast<uint64_t>(std::llround(static_cast<double>(frequency) / safe_rate))
         );
 
-        if (frame_period_ticks_ != ticks) {
+        // Small adjustments (the VR audio rate control below) keep the running deadline; only a
+        // real change of target, such as NTSC to PAL, restarts the pacing.
+        const bool small_change = frame_period_ticks_ != 0 &&
+            std::llabs(static_cast<long long>(ticks) - static_cast<long long>(frame_period_ticks_)) * 50 <
+                static_cast<long long>(frame_period_ticks_);
+        if (frame_period_ticks_ != ticks && small_change) {
+            frame_period_ticks_ = ticks;
+        } else if (frame_period_ticks_ != ticks) {
             frame_period_ticks_ = ticks;
             next_frame_deadline_ = 0;
             psxe_diag_breadcrumbf(
@@ -4552,6 +4839,16 @@ class ArmsxApp {
 #if defined(__ANDROID__) || defined(IOS_TARGET)
             flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
 #endif
+            if (vr_mode_) {
+                // An ES 3 context, which the XR thread shares and OpenXR requires. Only a window
+                // created with SDL_WINDOW_OPENGL keeps these attributes; otherwise the GLES2
+                // renderer recreates it with an ES 2 context.
+                SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengles2");
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+                flags |= SDL_WINDOW_OPENGL;
+            }
             window_ = SDL_CreateWindow(
                 "ARMSX",
                 SDL_WINDOWPOS_CENTERED,
@@ -4580,9 +4877,14 @@ class ArmsxApp {
 
         if (!renderer_) {
             psxe_diag_logf("renderer", "Renderer initialization failed: %s", SDL_GetError());
+            return false;
         }
 
-        return renderer_ != nullptr;
+        if (vr_mode_) {
+            startVr();
+        }
+
+        return true;
     }
 
     bool initializeFsui() {
@@ -4697,6 +4999,8 @@ class ArmsxApp {
 
         shutdownFsuiFrontend();
 
+        armsx::vr::Stop();
+
         if (owns_renderer_ && renderer_) {
             SDL_DestroyRenderer(renderer_);
         }
@@ -4756,6 +5060,10 @@ class ArmsxApp {
     void runFrame() {
         const bool fsui_was_active = fsui::HasActiveWindow();
         input_router_.tick(fsui_was_active);
+        pollVr(fsui_was_active);
+        if (!running_) {
+            return;
+        }
         syncPlatformLibraries(true, true);
 
         if (deferred_vsync_.has_value()) {
@@ -4772,13 +5080,20 @@ class ArmsxApp {
 
         consumePendingLaunchArguments();
 
-        waitForFrameDeadline(currentTargetFrameRate());
+        waitForFrameDeadline(pacedFrameRate());
+        const uint64_t frame_work_start = SDL_GetPerformanceCounter();
 
         std::uint32_t session_steps = 0;
+        uint64_t emulate_ticks = 0;
+        uint64_t texture_ticks = 0;
         if (session_.valid() && !session_.paused()) {
+            const uint64_t emulate_start = SDL_GetPerformanceCounter();
             session_steps = session_.runFrame();
+            const uint64_t texture_start = SDL_GetPerformanceCounter();
             session_.updateTexture(settings_);
             session_.finishHardwareFrame();
+            emulate_ticks = texture_start - emulate_start;
+            texture_ticks = SDL_GetPerformanceCounter() - texture_start;
         }
 
 #if defined(USE_HARDWARE) && defined(HW_DEBUG)
@@ -4799,6 +5114,7 @@ class ArmsxApp {
         }
 #endif
         imgui_backend_.newFrame();
+        feedVrImGui(fsui::HasActiveWindow());
 #if defined(USE_HARDWARE) && defined(HW_DEBUG)
         if (session_.valid() && session_.hardwareBackendActive()) {
             logUiRendererState("ui-post-imgui-backend");
@@ -4829,8 +5145,13 @@ class ArmsxApp {
 
         applyDeferredActions();
 
+        drawVrCursor();
         ImGui::Render();
-        imgui_backend_.renderDrawData(ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+        const uint64_t submit_start = SDL_GetPerformanceCounter();
+        if (!renderVrFrame()) {
+            imgui_backend_.renderDrawData(ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+        }
+        const uint64_t submit_ticks = SDL_GetPerformanceCounter() - submit_start;
 
 #if defined(USE_HARDWARE) && defined(HW_DEBUG)
         if (session_.valid() && session_.hardwareBackendActive()) {
@@ -4850,6 +5171,9 @@ class ArmsxApp {
         }
 
         advanceFrameDeadline();
+        if (vr_mode_ && VrPerfProbeEnabled()) {
+            probeVrPerformance(frame_work_start, session_steps != 0, emulate_ticks, texture_ticks, submit_ticks);
+        }
     }
 
     void applyCommand(const fsui::Command& command) {
@@ -4989,6 +5313,7 @@ class ArmsxApp {
             return false;
         }
 
+        applyVrStereo();
         input_router_.attach(session_.pad());
         mobile_controls_.showNow();
         resetFramePacing("launch-session");
@@ -5423,6 +5748,15 @@ class ArmsxApp {
         screenshot.on_activate = [this]() { deferred_screenshot_ = true; };
         items.push_back(std::move(screenshot));
 
+        if (vr_mode_) {
+            fsui::MenuItemDescriptor recenter;
+            recenter.id = "vr-recenter";
+            recenter.title = ICON_FA_BULLSEYE " Recenter Screen";
+            recenter.summary = "Move the screen straight ahead of where you are looking now.";
+            recenter.on_activate = []() { armsx::vr::Recenter(); };
+            items.push_back(std::move(recenter));
+        }
+
         fsui::MenuItemDescriptor settings;
         settings.id = "settings";
         settings.title = ICON_FA_SLIDERS_H " Settings";
@@ -5460,6 +5794,9 @@ class ArmsxApp {
             pages = buildPerGameSettingsPages();
         } else {
             pages = buildGlobalSettingsPages();
+        }
+        if (vr_mode_) {
+            pages.push_back(buildVrSettingsPage(scope));
         }
 
         if (pending_settings_page_restore_.has_value()) {
@@ -5947,7 +6284,7 @@ class ArmsxApp {
 #if defined(__EMSCRIPTEN__)
         const bool can_control_vsync = false;
 #else
-        const bool can_control_vsync = owns_renderer_ && !external_renderer_;
+        const bool can_control_vsync = owns_renderer_ && !external_renderer_ && !vr_mode_;
 #endif
 
 #ifdef USE_HARDWARE
@@ -6206,6 +6543,562 @@ class ArmsxApp {
 
         return initialBrowseDirectory();
     }
+
+    // ---- Quest VR --------------------------------------------------------------------------------
+
+    static constexpr std::array<uint8_t, 4> kCentredAnalog = {0x80, 0x80, 0x80, 0x80};
+
+    static uint32_t PadMaskFromVr(uint32_t buttons) {
+        static constexpr std::array<std::pair<uint32_t, uint32_t>, 16> table = {{
+            {armsx::vr::PAD_UP, PSXI_SW_SDA_PAD_UP},
+            {armsx::vr::PAD_DOWN, PSXI_SW_SDA_PAD_DOWN},
+            {armsx::vr::PAD_LEFT, PSXI_SW_SDA_PAD_LEFT},
+            {armsx::vr::PAD_RIGHT, PSXI_SW_SDA_PAD_RIGHT},
+            {armsx::vr::PAD_CROSS, PSXI_SW_SDA_CROSS},
+            {armsx::vr::PAD_CIRCLE, PSXI_SW_SDA_CIRCLE},
+            {armsx::vr::PAD_SQUARE, PSXI_SW_SDA_SQUARE},
+            {armsx::vr::PAD_TRIANGLE, PSXI_SW_SDA_TRIANGLE},
+            {armsx::vr::PAD_L1, PSXI_SW_SDA_L1},
+            {armsx::vr::PAD_R1, PSXI_SW_SDA_R1},
+            {armsx::vr::PAD_L2, PSXI_SW_SDA_L2},
+            {armsx::vr::PAD_R2, PSXI_SW_SDA_R2},
+            {armsx::vr::PAD_L3, PSXI_SW_SDA_L3},
+            {armsx::vr::PAD_R3, PSXI_SW_SDA_R3},
+            {armsx::vr::PAD_START, PSXI_SW_SDA_START},
+            {armsx::vr::PAD_SELECT, PSXI_SW_SDA_SELECT},
+        }};
+        uint32_t mask = 0;
+        for (const auto& [vr_bit, psx_bit] : table) {
+            if (buttons & vr_bit) {
+                mask |= psx_bit;
+            }
+        }
+        return mask;
+    }
+
+    void startVr() {
+        int width = 0;
+        int height = 0;
+        SDL_GetRendererOutputSize(renderer_, &width, &height);
+        std::string error;
+        if (!armsx::vr::Start(renderer_, width, height, settings_.vr_screen, error)) {
+            psxe_diag_logf("vr", "VR mode unavailable: %s", error.c_str());
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "ARMSX VR mode unavailable: %s", error.c_str());
+            return;
+        }
+        vr_width_ = width;
+        vr_height_ = height;
+        psxe_diag_logf("vr", "VR mode active screen=%dx%d", width, height);
+    }
+
+    // Controllers -> pad, Menu tap -> pause menu, focus loss -> pause. Runs once per frame, before
+    // the emulator steps.
+    void pollVr(bool fsui_active) {
+        if (!armsx::vr::Active()) {
+            return;
+        }
+        armsx::vr::GetSnapshot(vr_snapshot_);
+        if (vr_snapshot_.exit_requested) {
+            // Quit from the system menu: the runtime is ending the session.
+            running_ = false;
+            return;
+        }
+
+        const bool focused = vr_snapshot_.focused;
+        if (vr_focused_ && !focused && session_.valid() && !session_.paused() && !fsui_active) {
+            // A system overlay is up or the headset came off: nobody is watching the game.
+            openPauseMenu();
+            fsui_active = true;
+        }
+        vr_focused_ = focused;
+        if (!focused) {
+            vr_mapper_.ResetHeld();
+            input_router_.setVrPad(0, kCentredAnalog);
+            return;
+        }
+
+        const double now = static_cast<double>(SDL_GetTicks64()) / 1000.0;
+        const armsx::vr::MapperOutput out = vr_mapper_.Update(vr_snapshot_.controllers, now);
+        if (out.recenter) {
+            armsx::vr::Recenter();
+        }
+
+        bool in_game = session_.valid() && !fsui_active;
+        if (out.open_menu) {
+            if (in_game) {
+                openPauseMenu();
+                in_game = false;
+            } else if (session_.valid() && ui_window_state_ == FsuiWindowState::PauseMenu) {
+                // Menu toggles the pause menu, the way it opened it.
+                returnToMainWindow();
+                session_.setPaused(false);
+                resetFramePacing("vr-menu-resume");
+            }
+        }
+
+        if (!in_game) {
+            vr_hold_until_release_ = true;
+            input_router_.setVrPad(0, kCentredAnalog);
+            return;
+        }
+        // The button that closed the menu (A on "Resume") must not also land in the game.
+        if (vr_hold_until_release_) {
+            if (out.pad.buttons != 0) {
+                input_router_.setVrPad(0, kCentredAnalog);
+                return;
+            }
+            vr_hold_until_release_ = false;
+        }
+
+        const armsx::vr::PadOutput& pad = out.pad;
+        input_router_.setVrPad(PadMaskFromVr(pad.buttons), {
+            armsx::vr::AnalogByte(pad.left_x, false),
+            armsx::vr::AnalogByte(pad.left_y, true),
+            armsx::vr::AnalogByte(pad.right_x, false),
+            armsx::vr::AnalogByte(pad.right_y, true),
+        });
+    }
+
+    // While FSUI is open, the controllers drive ImGui: the laser pointer of whichever hand last
+    // pulled its trigger is the mouse, the trigger clicks, the right stick scrolls, and the face
+    // buttons, grips and left stick are the gamepad navigation FSUI is built around. Runs between
+    // the platform backend's NewFrame and ImGui::NewFrame. Only changes are sent, so a Bluetooth
+    // pad paired to the headset keeps working alongside.
+    void feedVrImGui(bool fsui_active) {
+        if (!armsx::vr::Active()) {
+            return;
+        }
+        ImGuiIO& io = ImGui::GetIO();
+        // The frame textures are this size; keep ImGui's layout and pointer maths in step with
+        // them even if the Android surface ever changes size.
+        io.DisplaySize = ImVec2(static_cast<float>(vr_width_), static_cast<float>(vr_height_));
+        io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+        io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+
+        const bool ui_input = vr_focused_ && fsui_active;
+        const armsx::vr::ControllerInput& in = vr_snapshot_.controllers;
+        const auto hysteresis = [](bool was_down, float value) {
+            return was_down ? value > 0.4f : value > 0.6f;
+        };
+
+        const float triggers[2] = {in.left_trigger, in.right_trigger};
+        for (int hand = 0; hand < 2; hand++) {
+            const bool was_down = vr_trigger_down_[hand];
+            vr_trigger_down_[hand] = hysteresis(was_down, triggers[hand]);
+            if (vr_trigger_down_[hand] && !was_down) {
+                vr_pointer_hand_ = hand;
+            }
+        }
+        const int other = 1 - vr_pointer_hand_;
+        if (!vr_snapshot_.pointer[vr_pointer_hand_].valid && vr_snapshot_.pointer[other].valid &&
+            !vr_trigger_down_[vr_pointer_hand_]) {
+            vr_pointer_hand_ = other;
+        }
+
+        const armsx::vr::PointerHit& hit = vr_snapshot_.pointer[vr_pointer_hand_];
+        const bool cursor_was_visible = vr_cursor_visible_;
+        vr_cursor_visible_ = ui_input && hit.valid;
+        if (vr_cursor_visible_) {
+            vr_cursor_ = ImVec2(hit.u * io.DisplaySize.x, hit.v * io.DisplaySize.y);
+            io.AddMouseSourceEvent(ImGuiMouseSource_Mouse);
+            io.AddMousePosEvent(vr_cursor_.x, vr_cursor_.y);
+        } else if (cursor_was_visible) {
+            io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+        }
+
+        const bool click = ui_input && vr_trigger_down_[vr_pointer_hand_];
+        if (click != vr_mouse_down_) {
+            io.AddMouseButtonEvent(ImGuiMouseButton_Left, click);
+            vr_mouse_down_ = click;
+        }
+
+        if (ui_input && std::fabs(in.right_y) > 0.25f) {
+            io.AddMouseWheelEvent(0.0f, in.right_y * 0.35f);
+        }
+
+        vr_nav_x_ = StickNavAxis(vr_nav_x_, in.left_x);
+        vr_nav_y_ = StickNavAxis(vr_nav_y_, in.left_y);
+        const std::array<std::pair<ImGuiKey, bool>, 10> keys = {{
+            {ImGuiKey_GamepadFaceDown, in.a},
+            {ImGuiKey_GamepadFaceRight, in.b},
+            {ImGuiKey_GamepadFaceLeft, in.x},
+            {ImGuiKey_GamepadFaceUp, in.y},
+            {ImGuiKey_GamepadL1, in.left_grip > 0.6f},
+            {ImGuiKey_GamepadR1, in.right_grip > 0.6f},
+            {ImGuiKey_GamepadDpadUp, vr_nav_y_ > 0},
+            {ImGuiKey_GamepadDpadDown, vr_nav_y_ < 0},
+            {ImGuiKey_GamepadDpadLeft, vr_nav_x_ < 0},
+            {ImGuiKey_GamepadDpadRight, vr_nav_x_ > 0},
+        }};
+        for (size_t i = 0; i < keys.size(); i++) {
+            const bool down = ui_input && keys[i].second;
+            const uint32_t bit = 1u << i;
+            if (down != ((vr_keys_down_ & bit) != 0)) {
+                io.AddKeyEvent(keys[i].first, down);
+                vr_keys_down_ = down ? (vr_keys_down_ | bit) : (vr_keys_down_ & ~bit);
+            }
+        }
+    }
+
+    static int StickNavAxis(int state, float value) {
+        if (state > 0) {
+            return value > 0.4f ? 1 : 0;
+        }
+        if (state < 0) {
+            return value < -0.4f ? -1 : 0;
+        }
+        return value > 0.6f ? 1 : (value < -0.6f ? -1 : 0);
+    }
+
+    // Off unless asked for, read once at startup: adb shell setprop debug.armsx.perf 1
+    static bool VrPerfProbeEnabled() {
+#if defined(__ANDROID__)
+        static const bool enabled = [] {
+            char value[PROP_VALUE_MAX] = {};
+            return __system_property_get("debug.armsx.perf", value) > 0 && value[0] == '1';
+        }();
+        return enabled;
+#else
+        return false;
+#endif
+    }
+
+    // Every two seconds in VR mode: emulated fps, frame work time and audio queue health, on
+    // logcat (adb logcat -s ARMSX-PERF). Frame work is everything after the pacing wait.
+    void probeVrPerformance(uint64_t frame_work_start, bool emulated, uint64_t emulate_ticks, uint64_t texture_ticks,
+                            uint64_t submit_ticks) {
+        const uint64_t now = SDL_GetPerformanceCounter();
+        const double work_ms = CounterTicksToMilliseconds(now - frame_work_start);
+        if (vr_probe_.window_start == 0) {
+            vr_probe_ = VrProbe{};
+            vr_probe_.window_start = now;
+            vr_probe_.underruns_at_start = session_.valid() ? session_.audioUnderruns() : 0;
+        }
+        vr_probe_.frames++;
+        vr_probe_.emulated += emulated ? 1 : 0;
+        vr_probe_.work_total_ms += work_ms;
+        vr_probe_.emulate_total_ms += CounterTicksToMilliseconds(emulate_ticks);
+        vr_probe_.emulate_max_ms = std::max(vr_probe_.emulate_max_ms, CounterTicksToMilliseconds(emulate_ticks));
+        vr_probe_.texture_total_ms += CounterTicksToMilliseconds(texture_ticks);
+        vr_probe_.submit_total_ms += CounterTicksToMilliseconds(submit_ticks);
+        vr_probe_.work_max_ms = std::max(vr_probe_.work_max_ms, work_ms);
+        vr_probe_.late_frames += work_ms > 1000.0 / std::max(currentTargetFrameRate(), 1.0) ? 1 : 0;
+        const double queued = session_.valid() ? session_.queuedAudioMs() : -1.0;
+        if (queued >= 0.0) {
+            vr_probe_.audio_min_ms = std::min(vr_probe_.audio_min_ms, queued);
+            vr_probe_.audio_max_ms = std::max(vr_probe_.audio_max_ms, queued);
+        }
+
+        const double window_ms = CounterTicksToMilliseconds(now - vr_probe_.window_start);
+        if (window_ms < 2000.0) {
+            return;
+        }
+        const uint64_t underruns = session_.valid() ? session_.audioUnderruns() : 0;
+        const double frames = std::max<uint32_t>(vr_probe_.frames, 1u);
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_INFO, "ARMSX-PERF",
+#else
+        psxe_diag_logf("perf",
+#endif
+            "emu_fps=%.2f loop_fps=%.2f work_avg=%.2fms work_max=%.2fms emulate_avg=%.2fms emulate_max=%.2fms "
+            "texture3d_avg=%.2fms submit_avg=%.2fms (begin=%.2f draw=%.2f end=%.2f) ui_avg=%.2fms late=%u audio_queue=%.0f..%.0fms underruns=%llu\n",
+            vr_probe_.emulated * 1000.0 / window_ms,
+            vr_probe_.frames * 1000.0 / window_ms,
+            vr_probe_.work_total_ms / frames,
+            vr_probe_.work_max_ms,
+            vr_probe_.emulate_total_ms / frames,
+            vr_probe_.emulate_max_ms,
+            vr_probe_.texture_total_ms / frames,
+            vr_probe_.submit_total_ms / frames,
+            vr_probe_.begin_total_ms / frames,
+            vr_probe_.draw_total_ms / frames,
+            vr_probe_.end_total_ms / frames,
+            (vr_probe_.work_total_ms - vr_probe_.emulate_total_ms - vr_probe_.texture_total_ms - vr_probe_.submit_total_ms) / frames,
+            vr_probe_.late_frames,
+            vr_probe_.audio_min_ms > 1e8 ? -1.0 : vr_probe_.audio_min_ms,
+            vr_probe_.audio_max_ms,
+            static_cast<unsigned long long>(underruns - std::min(underruns, vr_probe_.underruns_at_start)));
+        vr_probe_.window_start = 0;
+    }
+
+    void drawVrCursor() {
+        if (!vr_cursor_visible_) {
+            return;
+        }
+        ImDrawList* draw_list = ImGui::GetForegroundDrawList();
+        const float radius = std::max(6.0f, ImGui::GetIO().DisplaySize.y / 110.0f);
+        draw_list->AddCircleFilled(vr_cursor_, radius + 2.0f, IM_COL32(0, 0, 0, 170));
+        draw_list->AddCircleFilled(vr_cursor_, radius, vr_mouse_down_ ? IM_COL32(110, 180, 255, 255) : IM_COL32(255, 255, 255, 240));
+    }
+
+    // Draws ImGui's frame into the next VR frame texture instead of presenting the window.
+    // In 3D, the same ImGui frame is drawn once per eye, each time with that eye's game image in
+    // the texture the frame places; FSUI and the cursor come out identical, on the screen plane.
+    bool renderVrFrame() {
+        const uint64_t begin_start = SDL_GetPerformanceCounter();
+        armsx::vr::FrameTargets targets;
+        if (!armsx::vr::BeginFrame(targets)) {
+            return false;
+        }
+        const uint64_t draw_start = SDL_GetPerformanceCounter();
+        const bool stereo = session_.valid() && session_.stereoReady();
+        for (int eye = 0; eye < (stereo ? 2 : 1); eye++) {
+            if (stereo && eye == 1) {
+                SwapDrawTexture(session_.stereoTexture(0), session_.stereoTexture(1));
+            }
+            SDL_SetRenderTarget(renderer_, targets.eye[eye]);
+            SDL_RenderSetScale(renderer_, 1.0f, 1.0f);
+            SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
+            SDL_RenderClear(renderer_);
+            ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer_);
+            SDL_RenderFlush(renderer_);
+        }
+        if (stereo) {
+            SwapDrawTexture(session_.stereoTexture(1), session_.stereoTexture(0));
+        }
+        SDL_SetRenderTarget(renderer_, nullptr);
+        const uint64_t end_start = SDL_GetPerformanceCounter();
+        armsx::vr::EndFrame(stereo);
+        const uint64_t end_done = SDL_GetPerformanceCounter();
+        vr_probe_.begin_total_ms += CounterTicksToMilliseconds(draw_start - begin_start);
+        vr_probe_.draw_total_ms += CounterTicksToMilliseconds(end_start - draw_start);
+        vr_probe_.end_total_ms += CounterTicksToMilliseconds(end_done - end_start);
+        return true;
+    }
+
+    // Points every draw command that shows `from` at `to` instead.
+    static void SwapDrawTexture(SDL_Texture* from, SDL_Texture* to) {
+        const ImTextureID from_id = reinterpret_cast<ImTextureID>(from);
+        ImDrawData* draw_data = ImGui::GetDrawData();
+        for (ImDrawList* list : draw_data->CmdLists) {
+            for (ImDrawCmd& command : list->CmdBuffer) {
+                if (!command.TexRef._TexData && command.TexRef._TexID == from_id) {
+                    command.TexRef._TexID = reinterpret_cast<ImTextureID>(to);
+                }
+            }
+        }
+    }
+
+    void applyVrScreen() {
+        armsx::vr::SetScreenConfig(settings_.vr_screen);
+        applyVrStereo();
+        SaveSettings(settings_);
+    }
+
+    void applyVrStereo() {
+        const bool enabled = armsx::vr::Active() && settings_.vr_depth_percent > 0;
+        session_.setStereo(
+            enabled,
+            static_cast<float>(settings_.vr_depth_percent) / 100.0f,
+            static_cast<float>(settings_.vr_popout),
+            settings_.vr_screen.width_m);
+    }
+
+    fsui::SettingsPageDescriptor buildVrSettingsPage(fsui::SettingsScope scope) {
+        fsui::SettingsPageDescriptor page;
+        page.id = "VR";
+        page.scope = scope;
+        page.icon = ICON_FA_TV;
+        page.title = "VR Screen";
+        page.build_rows = [this]() {
+            std::vector<fsui::SettingsRowDescriptor> rows;
+
+            static constexpr std::array<int, 7> widths_cm = {160, 200, 240, 280, 320, 400, 500};
+            static constexpr std::array<int, 7> distances_cm = {100, 125, 150, 175, 200, 250, 300};
+            const auto metres = [](int cm) {
+                char text[16] = {};
+                std::snprintf(text, sizeof(text), "%.2f m", static_cast<double>(cm) / 100.0);
+                return std::string(text);
+            };
+            const auto choice_rows = [&](const auto& values, float current_m, std::string& value_title) {
+                std::vector<std::string> titles;
+                int selected = 0;
+                int best = INT32_MAX;
+                const int current_cm = static_cast<int>(std::lround(current_m * 100.0f));
+                for (size_t i = 0; i < values.size(); i++) {
+                    titles.push_back(metres(values[i]));
+                    if (std::abs(values[i] - current_cm) < best) {
+                        best = std::abs(values[i] - current_cm);
+                        selected = static_cast<int>(i);
+                    }
+                }
+                value_title = metres(current_cm);
+                return BuildChoices(titles, selected);
+            };
+
+            fsui::SettingsRowDescriptor width;
+            width.kind = fsui::SettingsRowKind::Choice;
+            width.id = "vr-screen-width";
+            width.title = ICON_FA_TV " Screen Width";
+            width.summary = "How wide the virtual screen is, edge to edge.";
+            width.dialog_title = width.title;
+            width.choices = choice_rows(widths_cm, settings_.vr_screen.width_m, width.value);
+            width.on_choice = [this](int index) {
+                if (index >= 0 && index < static_cast<int>(widths_cm.size())) {
+                    settings_.vr_screen.width_m = static_cast<float>(widths_cm[static_cast<size_t>(index)]) / 100.0f;
+                    applyVrScreen();
+                }
+            };
+            rows.push_back(std::move(width));
+
+            fsui::SettingsRowDescriptor distance;
+            distance.kind = fsui::SettingsRowKind::Choice;
+            distance.id = "vr-screen-distance";
+            distance.title = ICON_FA_RULER " Screen Distance";
+            distance.summary = "How far the middle of the screen is from your eyes. A curved screen keeps every point at this distance.";
+            distance.dialog_title = distance.title;
+            distance.choices = choice_rows(distances_cm, settings_.vr_screen.distance_m, distance.value);
+            distance.on_choice = [this](int index) {
+                if (index >= 0 && index < static_cast<int>(distances_cm.size())) {
+                    settings_.vr_screen.distance_m = static_cast<float>(distances_cm[static_cast<size_t>(index)]) / 100.0f;
+                    applyVrScreen();
+                }
+            };
+            rows.push_back(std::move(distance));
+
+            fsui::SettingsRowDescriptor curved;
+            curved.kind = fsui::SettingsRowKind::Toggle;
+            curved.id = "vr-screen-curved";
+            curved.title = ICON_FA_GLOBE " Curved Screen";
+            curved.summary = "Wrap the screen around you so its edges are as close as its middle. Off shows a flat screen.";
+            curved.toggle_value = settings_.vr_screen.curved;
+            curved.on_toggle = [this](bool value) {
+                settings_.vr_screen.curved = value;
+                applyVrScreen();
+            };
+            rows.push_back(std::move(curved));
+
+            static constexpr std::array<int, 7> depth_percents = {0, 25, 50, 75, 100, 125, 150};
+            fsui::SettingsRowDescriptor depth;
+            depth.kind = fsui::SettingsRowKind::Choice;
+            depth.id = "vr-depth";
+            depth.title = ICON_FA_EYE " 3D Depth";
+            depth.summary =
+                "Real stereoscopic depth from the game's own 3D geometry. 100% matches your eye distance; "
+                "Off shows the game flat. HUDs, sprites and videos always sit on the screen.";
+            depth.value = settings_.vr_depth_percent == 0 ? std::string("Off") : std::to_string(settings_.vr_depth_percent) + "%";
+            depth.dialog_title = depth.title;
+            {
+                std::vector<std::string> titles;
+                int selected = 0;
+                for (size_t i = 0; i < depth_percents.size(); i++) {
+                    titles.push_back(depth_percents[i] == 0 ? std::string("Off") : std::to_string(depth_percents[i]) + "%");
+                    if (depth_percents[i] == settings_.vr_depth_percent) {
+                        selected = static_cast<int>(i);
+                    }
+                }
+                depth.choices = BuildChoices(titles, selected);
+            }
+            depth.on_choice = [this](int index) {
+                if (index >= 0 && index < static_cast<int>(depth_percents.size())) {
+                    settings_.vr_depth_percent = depth_percents[static_cast<size_t>(index)];
+                    applyVrScreen();
+                }
+            };
+            rows.push_back(std::move(depth));
+
+            static constexpr std::array<int, 6> popouts = {1, 2, 3, 4, 6, 8};
+            static constexpr std::array<const char*, 6> popout_titles = {
+                "Behind the screen", "Low", "Medium", "High", "Very high", "Extreme",
+            };
+            fsui::SettingsRowDescriptor popout;
+            popout.kind = fsui::SettingsRowKind::Choice;
+            popout.id = "vr-popout";
+            popout.title = ICON_FA_CHEVRON_UP " 3D Pop-Out";
+            popout.summary =
+                "How far the scene comes forward. Low keeps it behind the screen like a window; higher "
+                "brings nearer objects out towards you. Games scale their worlds differently, so tune per game.";
+            popout.dialog_title = popout.title;
+            {
+                std::vector<std::string> titles(popout_titles.begin(), popout_titles.end());
+                int selected = 1;
+                for (size_t i = 0; i < popouts.size(); i++) {
+                    if (popouts[i] == settings_.vr_popout) {
+                        selected = static_cast<int>(i);
+                    }
+                }
+                popout.value = popout_titles[static_cast<size_t>(selected)];
+                popout.choices = BuildChoices(titles, selected);
+            }
+            popout.on_choice = [this](int index) {
+                if (index >= 0 && index < static_cast<int>(popouts.size())) {
+                    settings_.vr_popout = popouts[static_cast<size_t>(index)];
+                    applyVrScreen();
+                }
+            };
+            rows.push_back(std::move(popout));
+
+            fsui::SettingsRowDescriptor recenter;
+            recenter.kind = fsui::SettingsRowKind::Action;
+            recenter.id = "vr-recenter";
+            recenter.title = ICON_FA_BULLSEYE " Recenter Screen";
+            recenter.summary = "Move the screen straight ahead of where you are looking now. In game: hold Menu and pull the right trigger.";
+            recenter.on_activate = []() { armsx::vr::Recenter(); };
+            rows.push_back(std::move(recenter));
+
+#if defined(__ANDROID__)
+            fsui::SettingsRowDescriptor storage;
+            storage.kind = fsui::SettingsRowKind::Action;
+            storage.id = "vr-storage-access";
+            storage.title = ICON_FA_FOLDER " Storage Access";
+            storage.summary =
+                "Let the file browser reach Internal Storage (Download and other folders) for BIOS files and games. "
+                "Opens the system permission page; return to ARMSX afterwards.";
+            storage.on_activate = []() { CallAndroidActivityVoidMethod("requestAllFilesAccess", "()V"); };
+            rows.push_back(std::move(storage));
+#endif
+
+            fsui::SettingsRowDescriptor controls;
+            controls.kind = fsui::SettingsRowKind::Notice;
+            controls.id = "vr-controls";
+            controls.title = ICON_FA_GAMEPAD " Touch Controls";
+            controls.summary =
+                "A B X Y: Cross Circle Square Triangle. Grips: L1 R1. Triggers: L2 R2. Left stick click: Start. "
+                "Right stick click: Select. Left stick: analog, D-pad on a hard push. Menu: pause menu. "
+                "Menu + left/right stick click: L3/R3. Menu + B: left stick analog-only. In menus, point and pull a trigger.";
+            rows.push_back(std::move(controls));
+
+            return rows;
+        };
+        return page;
+    }
+
+    struct VrProbe {
+        uint64_t window_start = 0;
+        uint32_t frames = 0;
+        uint32_t emulated = 0;
+        uint32_t late_frames = 0;
+        double work_total_ms = 0.0;
+        double work_max_ms = 0.0;
+        double emulate_total_ms = 0.0;
+        double emulate_max_ms = 0.0;
+        double texture_total_ms = 0.0;
+        double submit_total_ms = 0.0;
+        double begin_total_ms = 0.0;
+        double draw_total_ms = 0.0;
+        double end_total_ms = 0.0;
+        double audio_min_ms = 1e9;
+        double audio_max_ms = 0.0;
+        uint64_t underruns_at_start = 0;
+    };
+
+    bool vr_mode_ = false;
+    VrProbe vr_probe_{};
+    int vr_width_ = 0;
+    int vr_height_ = 0;
+    armsx::vr::Snapshot vr_snapshot_{};
+    armsx::vr::QuestPadMapper vr_mapper_{};
+    bool vr_focused_ = false;
+    bool vr_hold_until_release_ = true;
+    bool vr_trigger_down_[2] = {false, false};
+    int vr_pointer_hand_ = 1;
+    bool vr_cursor_visible_ = false;
+    ImVec2 vr_cursor_{};
+    bool vr_mouse_down_ = false;
+    int vr_nav_x_ = 0;
+    int vr_nav_y_ = 0;
+    uint32_t vr_keys_down_ = 0;
 
     int argc_ = 0;
     const char* const* argv_ = nullptr;

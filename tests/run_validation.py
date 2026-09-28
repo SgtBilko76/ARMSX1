@@ -16,6 +16,7 @@ CASES = {
     "sdl-audio": (["make", "test-sdl-audio"], 30.0),
     "chd": (["make", "test-chd"], 180.0),
     "zip": (["make", "test-zip"], 180.0),
+    "vr": (["make", "test-vr"], 60.0),
     "web": ([sys.executable, str(ROOT / "tests" / "validate_web.py")], 30.0),
 }
 
