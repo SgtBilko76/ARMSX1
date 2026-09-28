@@ -130,7 +130,7 @@ The frontend still draws with the SDL GLES renderer, but into an offscreen textu
 | Menu + B | Left stick analog-only (toggle) | |
 | Menu + right trigger | Recenter the screen | Recenter the screen |
 
-Screen width, distance and curvature are under **Settings → VR Screen** and are stored in `settings.toml` under `[vr]`. Opening the system menu or taking the headset off pauses the game. OpenXR messages are logged with the `ARMSX-XR` tag (`adb logcat -s ARMSX-XR`). For frame timing and audio queue statistics every two seconds, run `adb shell setprop debug.armsx.perf 1` before starting the app and read them with `adb logcat -s ARMSX-PERF`.
+Screen width, distance and curvature are under **Settings → VR Screen** and are stored in `settings.toml` under `[vr]`. Opening the system menu or taking the headset off pauses the game. OpenXR messages are logged with the `ARMSX-XR` tag (`adb logcat -s ARMSX-XR`). For frame timing and audio queue statistics every two seconds, run `adb shell setprop log.tag.ARMSX-PERF I` before starting the app and read them with `adb logcat -s ARMSX-PERF`.
 
 ### iOS
 Use the bundled SDL2 xcframework and run:

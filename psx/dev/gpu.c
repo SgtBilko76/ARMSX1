@@ -446,11 +446,14 @@ void gpu_render_triangle(psx_gpu_t* gpu, vertex_t v0, vertex_t v1, vertex_t v2, 
 
             gpu->vram[x + (y * 1024)] = color;
 
-            // Semi-transparent pixels keep the depth of what shows through them.
-            if (gpu->depth && !transp) {
-                gpu->depth[x + (y * 1024)] = (a.w < 0.0f)
-                    ? PSX_DEPTH_FLAT
-                    : ((z0 * a.w) + (z1 * b.w) + (z2 * c.w)) / area;
+            // A semi-transparent 3D surface (smoke, glass) keeps the depth of what shows through
+            // it. 2D polygons are flat whether blended or not: game text and logos are often
+            // drawn semi-transparent, and inheriting the background's depth tore them apart.
+            if (gpu->depth) {
+                if (a.w < 0.0f)
+                    gpu->depth[x + (y * 1024)] = PSX_DEPTH_FLAT;
+                else if (!transp)
+                    gpu->depth[x + (y * 1024)] = ((z0 * a.w) + (z1 * b.w) + (z2 * c.w)) / area;
             }
         }
     }
@@ -593,7 +596,8 @@ void gpu_render_rect(psx_gpu_t* gpu, rect_data_t data) {
 
             gpu->vram[x + (y * 1024)] = color;
 
-            if (gpu->depth && !transp)
+            // Sprites are 2D (text, HUD, logos): always on the screen plane, blended or not.
+            if (gpu->depth)
                 gpu->depth[x + (y * 1024)] = PSX_DEPTH_FLAT;
 
             skip:
@@ -2209,6 +2213,9 @@ void gpu_hblank_event(psx_gpu_t* gpu) {
         );
         if (gpu->event_cb_table[GPU_EVENT_VBLANK])
             gpu->event_cb_table[GPU_EVENT_VBLANK](gpu);
+
+        if (gpu->depth)
+            psx_depth_new_frame();
 
         psx_ic_irq(gpu->ic, IC_VBLANK);
     } else if (gpu->line == scans_per_frame) {

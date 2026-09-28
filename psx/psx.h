@@ -14,6 +14,9 @@
 #define PSXE_COMMIT STR(REP_COMMIT_HASH)
 #define PSXE_BUILD_OS STR(OS_INFO)
 
+#define PSX_SPU_CYCLES_PER_SAMPLE 768 /* 33.8688 MHz / 44.1 kHz */
+#define PSX_AUDIO_BUFFER_FRAMES 8192
+
 typedef struct {
     psx_bios_t* bios;
     psx_ram_t* ram;
@@ -33,6 +36,16 @@ typedef struct {
     psx_cdrom_t* cdrom;
     psx_pad_t* pad;
     psx_mdec_t* mdec;
+
+    /*
+        SPU output, produced as the CPU runs: one stereo sample every PSX_SPU_CYCLES_PER_SAMPLE
+        cycles, the way the real SPU keeps pace with the CPU. Generating a frame's worth at once
+        after the frame lost everything that happened between register writes within it (a
+        key-off's release before the next key-on), and every note change clicked.
+    */
+    int16_t audio[PSX_AUDIO_BUFFER_FRAMES * 2];
+    uint32_t audio_read, audio_write;
+    uint32_t spu_cycles;
 } psx_t;
 
 psx_t* psx_create(void);
@@ -51,6 +64,9 @@ void* psx_get_display_buffer(psx_t*);
    display buffer's layout: 1024 floats per row. NULL while off or in 24-bit display mode. */
 void psx_set_stereo_depth(psx_t*, int);
 const float* psx_get_display_depth(psx_t*);
+/* Takes up to `max_frames` stereo samples produced since the last call; returns how many. */
+int psx_read_audio(psx_t*, int16_t* out, int max_frames);
+int psx_audio_available(psx_t*);
 void* psx_get_vram(psx_t*);
 uint32_t psx_get_dmode_width(psx_t*);
 uint32_t psx_get_dmode_height(psx_t*);

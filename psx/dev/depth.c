@@ -14,10 +14,13 @@
 
 typedef struct {
     uint32_t key;
+    uint32_t frame;
     float w;
 } depth_entry_t;
 
 int g_psx_depth_capture = 0;
+
+static uint32_t g_depth_frame = 1;
 
 static depth_entry_t g_depth_cache[DEPTH_CACHE_SIZE];
 
@@ -30,6 +33,7 @@ void psx_depth_set_capture(int enabled) {
 
     for (uint32_t i = 0; i < DEPTH_CACHE_SIZE; i++) {
         g_depth_cache[i].key = 0;
+        g_depth_cache[i].frame = 0;
         g_depth_cache[i].w = PSX_DEPTH_FLAT;
     }
 }
@@ -41,11 +45,20 @@ void psx_depth_record(uint32_t sxy, uint32_t h, uint32_t sz) {
     depth_entry_t* entry = &g_depth_cache[depth_hash(sxy)];
 
     entry->key = sxy;
+    entry->frame = g_depth_frame;
     entry->w = (float)h / (float)sz;
+}
+
+void psx_depth_new_frame(void) {
+    g_depth_frame++;
 }
 
 float psx_depth_lookup(uint32_t sxy) {
     const depth_entry_t* entry = &g_depth_cache[depth_hash(sxy)];
 
-    return (entry->key == sxy) ? entry->w : PSX_DEPTH_FLAT;
+    // This frame's projections, or the previous frame's for games that draw a frame late.
+    if ((entry->key != sxy) || ((g_depth_frame - entry->frame) > 1))
+        return PSX_DEPTH_FLAT;
+
+    return entry->w;
 }

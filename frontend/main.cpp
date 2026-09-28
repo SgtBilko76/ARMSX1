@@ -1900,6 +1900,9 @@ bool SaveSettings(const FrontendSettings& settings) {
     return true;
 }
 
+// CD audio plus the SPU samples the core produced while the CPU ran this frame (psx_read_audio),
+// summed with saturation. `size` bytes of 16-bit stereo; the core's samples fill as much as they
+// cover.
 void MixPsxAudio(psx_t* psx, uint8_t* buffer, int size) {
     if (!psx || !buffer || size <= 0) {
         return;
@@ -1913,13 +1916,13 @@ void MixPsxAudio(psx_t* psx, uint8_t* buffer, int size) {
     psx_cdrom_get_audio_samples(cdrom, buffer, size);
     psx_spu_update_cdda_buffer(spu, cdrom->cdda_buf);
 
-    for (int sample = 0; sample < (size >> 2); sample++) {
-        const uint32_t value = psx_spu_get_sample(spu);
-        const int16_t left = static_cast<int16_t>(value & 0xffff);
-        const int16_t right = static_cast<int16_t>(value >> 16);
+    const int frames = size >> 2;
+    std::vector<int16_t> spu_samples(static_cast<size_t>(frames) * 2);
+    const int produced = psx_read_audio(psx, spu_samples.data(), frames);
 
-        *reinterpret_cast<int16_t*>(&buffer[(sample << 2) + 0]) += left;
-        *reinterpret_cast<int16_t*>(&buffer[(sample << 2) + 2]) += right;
+    auto* out = reinterpret_cast<int16_t*>(buffer);
+    for (int i = 0; i < produced * 2; i++) {
+        out[i] = static_cast<int16_t>(std::clamp(static_cast<int>(out[i]) + spu_samples[static_cast<size_t>(i)], -32768, 32767));
     }
 }
 
@@ -2100,6 +2103,12 @@ class ArmsxSession {
         desired.format = AUDIO_S16SYS;
         desired.channels = 2;
         desired.samples = 1024;
+#if defined(__ANDROID__)
+        // SDL's OpenSL ES output keeps just two buffers of this size. At 1024 frames that is 46 ms
+        // in all, and a short stall of its thread on a busy device (a VR headset especially) empties
+        // them: every such gap is an audible click.
+        desired.samples = 2048;
+#endif
         desired.callback = nullptr;
         desired.userdata = nullptr;
 
@@ -3011,17 +3020,20 @@ class ArmsxSession {
     }
 
     void queueAudioForFrame() {
-        if (!psx_ || !audio_dev_ || fast_forward_enabled_) {
+        if (!psx_) {
             return;
         }
 
-        audio_sample_accumulator_ += static_cast<double>(kAudioMixRate) / frameRate();
-        const int sample_count = static_cast<int>(audio_sample_accumulator_);
+        // Exactly the samples the SPU produced during this frame's emulation.
+        const int sample_count = psx_audio_available(psx_);
+        if (!audio_dev_ || fast_forward_enabled_) {
+            std::vector<int16_t> discard(static_cast<size_t>(std::max(sample_count, 0)) * 2);
+            psx_read_audio(psx_, discard.data(), sample_count);
+            return;
+        }
         if (sample_count <= 0) {
             return;
         }
-
-        audio_sample_accumulator_ -= static_cast<double>(sample_count);
 
         const size_t byte_count = static_cast<size_t>(sample_count) * sizeof(int16_t) * 2;
         if (byte_count == 0) {
@@ -4461,8 +4473,7 @@ class ArmsxApp {
     // In VR, the frame rate is nudged by at most +-0.5% so the queued audio stays near
     // kVrAudioTargetMs. Emulation is timed by the CPU clock and playback by the audio hardware's,
     // and the two drift apart: without this the queue slowly runs dry (clicks as SDL pads with
-    // silence) or overfills (and is flushed). Android pulls audio in ~23 ms chunks, so the target
-    // keeps well clear of that.
+    // silence) or overfills (and is flushed).
     double pacedFrameRate() const {
         const double rate = currentTargetFrameRate();
         if (!vr_mode_ || !session_.valid() || session_.paused() || session_.fastForwardEnabled()) {
@@ -4476,7 +4487,8 @@ class ArmsxApp {
         return rate * (1.0 - error * kVrAudioMaxRateAdjust);
     }
 
-    static constexpr double kVrAudioTargetMs = 60.0;
+    // Comfortably above one Android output buffer (2048 frames, ~46 ms), which is pulled at once.
+    static constexpr double kVrAudioTargetMs = 80.0;
     static constexpr double kVrAudioMaxRateAdjust = 0.005;
 
     void updateFramePeriod(double frame_rate) {
@@ -5194,6 +5206,12 @@ class ArmsxApp {
 
             case fsui::CommandType::Resume:
                 if (session_.valid()) {
+                    // The pause menu's Resume item only sends this command; FSUI's window stays up
+                    // until it is told to close. ReturnToMainWindow queues another Resume itself,
+                    // which finds the window closed and ends here.
+                    if (fsui::HasActiveWindow()) {
+                        fsui::ReturnToMainWindow();
+                    }
                     ui_window_state_ = FsuiWindowState::None;
                     session_.setPaused(false);
                     resetFramePacing("command-resume");
@@ -5749,6 +5767,16 @@ class ArmsxApp {
         items.push_back(std::move(screenshot));
 
         if (vr_mode_) {
+            fsui::MenuItemDescriptor vr_settings;
+            vr_settings.id = "vr-settings";
+            vr_settings.title = ICON_FA_TV " VR Settings";
+            vr_settings.summary = "Screen size, distance and curvature, 3D depth and pop-out.";
+            vr_settings.on_activate = [this]() {
+                pending_settings_page_restore_ = "VR";
+                switchToSettingsWindow();
+            };
+            items.push_back(std::move(vr_settings));
+
             fsui::MenuItemDescriptor recenter;
             recenter.id = "vr-recenter";
             recenter.title = ICON_FA_BULLSEYE " Recenter Screen";
@@ -6750,12 +6778,14 @@ class ArmsxApp {
         return value > 0.6f ? 1 : (value < -0.6f ? -1 : 0);
     }
 
-    // Off unless asked for, read once at startup: adb shell setprop debug.armsx.perf 1
+    // Off unless asked for, read once at startup: adb shell setprop log.tag.ARMSX-PERF I
+    // (log.tag.* properties are readable by any app, unlike debug.*).
     static bool VrPerfProbeEnabled() {
 #if defined(__ANDROID__)
         static const bool enabled = [] {
             char value[PROP_VALUE_MAX] = {};
-            return __system_property_get("debug.armsx.perf", value) > 0 && value[0] == '1';
+            return __system_property_get("log.tag.ARMSX-PERF", value) > 0 && value[0] != '\0' &&
+                value[0] != 'S';
         }();
         return enabled;
 #else

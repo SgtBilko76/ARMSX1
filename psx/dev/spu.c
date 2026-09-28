@@ -200,6 +200,10 @@ void spu_read_block(psx_spu_t* spu, int v) {
     unsigned shift  = 12 - hdr_shift;
     unsigned filter = (hdr >> 4) & 7;
 
+    // Only filters 0-4 exist; the hardware treats 5-7 like 4 (and the tables have five entries).
+    if (filter > 4)
+        filter = 4;
+
     int32_t f0 = g_spu_pos_adpcm_table[filter];
     int32_t f1 = g_spu_neg_adpcm_table[filter];
 
@@ -208,8 +212,11 @@ void spu_read_block(psx_spu_t* spu, int v) {
 
         // Sign extend t
         int16_t t = (int16_t)(n << 12) >> 12; 
-        int16_t s = (t << shift) + (((spu->data[v].h[0] * f0) + (spu->data[v].h[1] * f1) + 32) / 64);
-        
+        // Summed in 32 bits and saturated: the prediction regularly overshoots, and wrapping in
+        // 16 bits turned every overshoot into a full-scale spike that also corrupted the filter
+        // history. The hardware rounds with an arithmetic shift (towards minus infinity).
+        int32_t s = ((int32_t)t << shift) + (((spu->data[v].h[0] * f0) + (spu->data[v].h[1] * f1) + 32) >> 6);
+
         s = (s < INT16_MIN) ? INT16_MIN : ((s > INT16_MAX) ? INT16_MAX : s);
 
         spu->data[v].h[1] = spu->data[v].h[0];

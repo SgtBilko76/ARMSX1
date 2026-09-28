@@ -56,6 +56,7 @@ typedef struct {
 
 psx_mcd_t* psx_mcd_create(void);
 int psx_mcd_init(psx_mcd_t*, const char*);
+void psx_mcd_flush_sector(psx_mcd_t*, uint32_t offset);
 uint8_t psx_mcd_read(psx_mcd_t*);
 void psx_mcd_write(psx_mcd_t*, uint8_t);
 int psx_mcd_query(psx_mcd_t*);

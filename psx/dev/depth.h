@@ -27,6 +27,10 @@
 extern int g_psx_depth_capture;
 
 void psx_depth_set_capture(int enabled);
+
+/* Called at every vblank. Projections older than the previous frame are forgotten: a 2D sprite
+   drawn later at a screen position some 3D vertex once had must not inherit its depth. */
+void psx_depth_new_frame(void);
 void psx_depth_record(uint32_t sxy, uint32_t h, uint32_t sz);
 
 /* The recorded w for a GPU vertex word, or PSX_DEPTH_FLAT when the GTE never produced it. */

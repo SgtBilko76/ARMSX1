@@ -50,6 +50,42 @@ void psx_update(psx_t* psx) {
     psx_pad_update(psx->pad, psx->cpu->last_cycles);
     psx_timer_update(psx->timer, psx->cpu->last_cycles);
     psx_dma_update(psx->dma, psx->cpu->last_cycles);
+
+    psx->spu_cycles += psx->cpu->last_cycles;
+
+    while (psx->spu_cycles >= PSX_SPU_CYCLES_PER_SAMPLE) {
+        psx->spu_cycles -= PSX_SPU_CYCLES_PER_SAMPLE;
+
+        const uint32_t sample = psx_spu_get_sample(psx->spu);
+        const uint32_t slot = psx->audio_write % PSX_AUDIO_BUFFER_FRAMES;
+
+        psx->audio[slot * 2 + 0] = (int16_t)(sample & 0xffff);
+        psx->audio[slot * 2 + 1] = (int16_t)(sample >> 16);
+        psx->audio_write++;
+
+        // Nobody draining (fast forward, a paused frontend): keep only the newest samples.
+        if ((psx->audio_write - psx->audio_read) > PSX_AUDIO_BUFFER_FRAMES)
+            psx->audio_read = psx->audio_write - PSX_AUDIO_BUFFER_FRAMES;
+    }
+}
+
+int psx_audio_available(psx_t* psx) {
+    return (int)(psx->audio_write - psx->audio_read);
+}
+
+int psx_read_audio(psx_t* psx, int16_t* out, int max_frames) {
+    int frames = 0;
+
+    while ((frames < max_frames) && (psx->audio_read != psx->audio_write)) {
+        const uint32_t slot = psx->audio_read % PSX_AUDIO_BUFFER_FRAMES;
+
+        out[frames * 2 + 0] = psx->audio[slot * 2 + 0];
+        out[frames * 2 + 1] = psx->audio[slot * 2 + 1];
+        psx->audio_read++;
+        frames++;
+    }
+
+    return frames;
 }
 
 void psx_run_frame(psx_t* psx) {

@@ -885,16 +885,18 @@ void main() {
 				XR_LOG("display refresh rate %.1f Hz", current);
 		}
 
-		// The emulator is one busy CPU thread; the GPU only composites a single layer.
+		// The emulator is one busy CPU thread that must finish a frame in 16.7 ms, so it asks for
+		// the highest CPU level (as ARMSX2 does); at "sustained high" a Quest 3 settles around
+		// 1.9 GHz, too slow for heavier games, and the audio runs dry. The GPU only composites.
 		void RequestPerformanceLevels()
 		{
 			if (!m_has_perf_settings_ext)
 				return;
 			const XrResult cpu = m_xr.xrPerfSettingsSetPerformanceLevelEXT(m_session, XR_PERF_SETTINGS_DOMAIN_CPU_EXT,
-				XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
+				XR_PERF_SETTINGS_LEVEL_BOOST_EXT);
 			const XrResult gpu = m_xr.xrPerfSettingsSetPerformanceLevelEXT(m_session, XR_PERF_SETTINGS_DOMAIN_GPU_EXT,
 				XR_PERF_SETTINGS_LEVEL_SUSTAINED_LOW_EXT);
-			XR_LOG("performance levels: cpu sustained-high %s, gpu sustained-low %s",
+			XR_LOG("performance levels: cpu boost %s, gpu sustained-low %s",
 				XR_SUCCEEDED(cpu) ? "ok" : "refused", XR_SUCCEEDED(gpu) ? "ok" : "refused");
 		}
 

@@ -42,7 +42,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "FRAME_HASH failed reason=init\n");
         return 1;
     }
-    if (!psx_cdrom_open(psx_get_cdrom(psx), argv[2])) { /* returns 1 on success */
+    /* "-" boots the BIOS with no disc. */
+    if (strcmp(argv[2], "-") && !psx_cdrom_open(psx_get_cdrom(psx), argv[2])) { /* returns 1 on success */
         fprintf(stderr, "FRAME_HASH failed reason=disc\n");
         return 1;
     }
@@ -65,7 +66,8 @@ int main(int argc, char** argv) {
     unsigned long long spu_samples = 0, spu_clipped = 0, mix_wrapped = 0, cd_nonzero = 0, loud = 0;
     unsigned long long vol_negative = 0, vol_sweep = 0, voice_checks = 0;
     unsigned main_vol_seen[4] = {0, 0, 0, 0};
-    int16_t buffer[735 * 2];
+    int16_t buffer[PSX_AUDIO_BUFFER_FRAMES * 2];
+    int16_t spu_out[PSX_AUDIO_BUFFER_FRAMES * 2];
 
     const clock_t start = clock();
     for (int frame = 1; frame <= frames; frame++) {
@@ -73,25 +75,26 @@ int main(int argc, char** argv) {
 
         if (audio) {
             psx_spu_t* spu = psx->spu;
-            memset(buffer, 0, sizeof(buffer));
-            psx_cdrom_get_audio_samples(psx->cdrom, buffer, sizeof(buffer));
+            /* Exactly like the frontend: the samples the SPU produced during the frame, plus CD audio. */
+            const int frames_now = psx_read_audio(psx, spu_out, PSX_AUDIO_BUFFER_FRAMES);
+            memset(buffer, 0, (size_t)frames_now * 4);
+            psx_cdrom_get_audio_samples(psx->cdrom, buffer, (size_t)frames_now * 4);
             psx_spu_update_cdda_buffer(spu, psx->cdrom->cdda_buf);
-            for (int i = 0; i < 735; i++) {
+            for (int i = 0; i < frames_now; i++) {
                 for (int c = 0; c < 2; c++)
                     cd_nonzero += buffer[i * 2 + c] != 0;
-                const uint32_t value = psx_spu_get_sample(spu);
-                const int16_t sv[2] = {(int16_t)(value & 0xffff), (int16_t)(value >> 16)};
+                const int16_t sv[2] = {spu_out[i * 2], spu_out[i * 2 + 1]};
                 for (int c = 0; c < 2; c++) {
                     spu_samples++;
                     spu_clipped += (sv[c] >= 32766 || sv[c] <= -32767);
                     const int sum = buffer[i * 2 + c] + sv[c];
+                    mix_wrapped += (sum > 32767 || sum < -32768);
+                    loud += (sum > 24000 || sum < -24000);
                     if (wav) {
                         const int16_t out = (int16_t)(sum > 32767 ? 32767 : (sum < -32768 ? -32768 : sum));
                         fwrite(&out, sizeof(out), 1, wav);
                         wav_bytes += sizeof(out);
                     }
-                    mix_wrapped += (sum > 32767 || sum < -32768);
-                    loud += (sum > 24000 || sum < -24000);
                 }
             }
             for (int v = 0; v < 24; v++) {

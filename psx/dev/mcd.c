@@ -67,6 +67,21 @@ static void psx_mcd_ensure_parent(const char* path) {
 #endif
 }
 
+void psx_mcd_flush_sector(psx_mcd_t* mcd, uint32_t offset) {
+    if (!mcd->path)
+        return;
+
+    FILE* file = fopen(mcd->path, "r+b");
+
+    if (!file)
+        return;
+
+    if (fseek(file, (long)offset, SEEK_SET) == 0)
+        fwrite(mcd->buf + offset, 1, 128, file);
+
+    fclose(file);
+}
+
 psx_mcd_t* psx_mcd_create(void) {
     return (psx_mcd_t*)malloc(sizeof(psx_mcd_t));
 }
@@ -76,7 +91,17 @@ int psx_mcd_init(psx_mcd_t* mcd, const char* path) {
 
     mcd->state = MCD_STATE_TX_HIZ;
     mcd->flag = 0x08;
-    mcd->path = path;
+    // A copy: callers pass temporaries, and the card is written back long after this returns.
+    mcd->path = NULL;
+
+    if (path) {
+        char* copy = malloc(strlen(path) + 1);
+
+        if (copy)
+            memcpy(copy, path, strlen(path) + 1);
+
+        mcd->path = copy;
+    }
     mcd->buf = malloc(MCD_MEMORY_SIZE);
     mcd->tx_data_ready = 0;
 
@@ -201,10 +226,15 @@ uint8_t psx_mcd_read(psx_mcd_t* mcd) {
         case MCD_W_STATE_RX_DATA: {
              --mcd->pending_bytes;
 
-            mcd->buf[mcd->addr++] = mcd->rx_data;
+            mcd->buf[mcd->addr & (MCD_MEMORY_SIZE - 1)] = mcd->rx_data;
+            mcd->addr++;
 
             if (!mcd->pending_bytes) {
                 mcd->tx_data = mcd->rx_data;
+
+                // Save the sector right away: if the app is closed instead of the game being
+                // quit (a headset's system menu, a crash), the card still holds the save.
+                psx_mcd_flush_sector(mcd, (mcd->addr - 128) & (MCD_MEMORY_SIZE - 1));
 
                 break;
             }
@@ -284,6 +314,7 @@ void psx_mcd_destroy(psx_mcd_t* mcd) {
         fclose(file);
     }
 
+    free((char*)mcd->path);
     free(mcd->buf);
     free(mcd);
 }
