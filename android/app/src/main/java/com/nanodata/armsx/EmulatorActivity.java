@@ -1,6 +1,7 @@
 package com.nanodata.armsx;
 
 import android.content.ContentResolver;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
@@ -9,8 +10,12 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.provider.DocumentsContract;
+import android.provider.Settings;
+import android.system.ErrnoException;
+import android.system.Os;
 import android.util.Log;
 import android.view.View;
 import android.view.Window;
@@ -19,6 +24,7 @@ import android.view.WindowInsetsController;
 import android.view.WindowManager;
 
 import org.libsdl.app.SDLActivity;
+import org.libsdl.app.SDLSurface;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -42,7 +48,11 @@ public class EmulatorActivity extends SDLActivity {
     private static final int REQUEST_LIBRARY_DIRECTORY = 4301;
     private static final String PREFS_NAME = "armsx_mobile_library";
     private static final String PREF_LIBRARY_ROOTS = "library_roots";
+    private static final String PREF_ASKED_ALL_FILES_ACCESS = "asked_all_files_access";
     private static final String VIRTUAL_PREFIX = "armsx-android:///";
+    // Quest build: the resolution of the virtual screen in the headset. See createSDLSurface().
+    private static final int VR_SCREEN_WIDTH = 1920;
+    private static final int VR_SCREEN_HEIGHT = 1080;
 
     private static native void nativeEnqueueLaunchArgument(String argument);
     private static native void nativeSetPlatformLibrarySnapshot(
@@ -76,10 +86,76 @@ public class EmulatorActivity extends SDLActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        if (BuildConfig.QUEST_VR) {
+            // Read by the native frontend (armsx::vr::Requested) before it creates its window, so
+            // this has to happen before SDL starts its main thread.
+            try {
+                Os.setenv("ARMSX_VR", "1", true);
+            } catch (ErrnoException e) {
+                Log.e(TAG, "Unable to enable VR mode", e);
+            }
+        }
         super.onCreate(savedInstanceState);
-        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        if (!BuildConfig.QUEST_VR) {
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        }
         applyImmersiveMode();
         scanPersistedLibrariesAsync();
+        if (BuildConfig.QUEST_VR) {
+            requestAllFilesAccessOnce();
+        }
+    }
+
+    // Quest build: BIOS files and games copied onto the headset over USB land in shared storage
+    // (Download and friends), which the FSUI file browser can only reach with all-files access.
+    // Asked once automatically; Settings > VR Screen > Storage Access asks again.
+    private void requestAllFilesAccessOnce() {
+        if (hasAllFilesAccess()) {
+            return;
+        }
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (prefs.getBoolean(PREF_ASKED_ALL_FILES_ACCESS, false)) {
+            return;
+        }
+        prefs.edit().putBoolean(PREF_ASKED_ALL_FILES_ACCESS, true).apply();
+        requestAllFilesAccess();
+    }
+
+    private static boolean hasAllFilesAccess() {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager();
+    }
+
+    // Called from native code (Settings > VR Screen > Storage Access).
+    public void requestAllFilesAccess() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return;
+        }
+        runOnUiThread(() -> {
+            try {
+                startActivity(new Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:" + getPackageName())
+                ));
+            } catch (Exception appPageMissing) {
+                try {
+                    startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                } catch (Exception e) {
+                    Log.e(TAG, "Unable to open the all-files access settings", e);
+                }
+            }
+        });
+    }
+
+    @Override
+    protected SDLSurface createSDLSurface(Context context) {
+        SDLSurface surface = super.createSDLSurface(context);
+        if (BuildConfig.QUEST_VR) {
+            // In the headset this surface is never shown: the frontend draws into offscreen
+            // textures of the window's size, which OpenXR puts on the virtual screen. A fixed
+            // buffer size makes that the screen's resolution, whatever the activity window is.
+            surface.getHolder().setFixedSize(VR_SCREEN_WIDTH, VR_SCREEN_HEIGHT);
+        }
+        return surface;
     }
 
     @Override
@@ -211,10 +287,20 @@ public class EmulatorActivity extends SDLActivity {
     }
 
     public int openVirtualFileDescriptor(String virtualPath) {
-        final String uriText;
+        String mapped;
         synchronized (libraryLock) {
-            uriText = virtualFileUris.get(virtualPath);
+            mapped = virtualFileUris.get(virtualPath);
+            if (mapped == null) {
+                // Cue sheets often name their tracks in another case ("GAME.BIN" for "Game.bin").
+                for (Map.Entry<String, String> entry : virtualFileUris.entrySet()) {
+                    if (entry.getKey().equalsIgnoreCase(virtualPath)) {
+                        mapped = entry.getValue();
+                        break;
+                    }
+                }
+            }
         }
+        final String uriText = mapped;
         if (uriText == null) {
             Log.w(TAG, "No document URI mapped for " + virtualPath);
             return -1;
@@ -503,8 +589,9 @@ public class EmulatorActivity extends SDLActivity {
 
     @Override
     protected String[] getArguments() {
+        // SDL supplies argv[0] ("app_process") itself; everything here is a real argument, and a
+        // bare word would be taken as a game to boot.
         List<String> args = new ArrayList<>();
-        args.add("armsx");
 
         String biosPath = copyBundledBios();
         if (biosPath != null) {

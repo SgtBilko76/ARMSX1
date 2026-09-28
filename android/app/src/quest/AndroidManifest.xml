@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Quest flavor only, merged onto src/main/AndroidManifest.xml.
+
+  A fully immersive app: EmulatorActivity launches straight into VR (com.oculus.intent.category.VR)
+  and shows the whole frontend on an OpenXR virtual screen. The OpenXR permissions and the
+  runtime-broker <queries> come from the loader .aar's own manifest.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Sideloaded like ARMSX2's quest build: BIOS files and games copied onto the headset are
+         reachable from the FSUI file browser (EmulatorActivity asks for it on first launch). -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <uses-feature
+        android:name="android.hardware.vr.headtracking"
+        android:required="true"
+        android:version="1" />
+
+    <application>
+        <meta-data
+            android:name="com.oculus.supportedDevices"
+            android:value="quest2|questpro|quest3|quest3s" />
+
+        <!-- How PICO OS recognises a VR application; ignored by Horizon OS. Untested on PICO. -->
+        <meta-data
+            android:name="pvr.app.type"
+            android:value="vr" />
+
+        <activity android:name=".EmulatorActivity">
+            <!-- Keeps the session alive (VISIBLE, not STOPPED) under the system menu. -->
+            <meta-data
+                android:name="com.oculus.vr.focusaware"
+                android:value="true" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="com.oculus.intent.category.VR" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

@@ -39,7 +39,7 @@ The accelerated mode uploads only changed VRAM scanlines to an SDL texture. It d
 
 ## Supported Targets
 - Desktop: macOS, Linux, Windows
-- Mobile and alternate hosts: Android, iOS, UWP, WebAssembly, PSVita
+- Mobile and alternate hosts: Android, Meta Quest (standalone VR), iOS, UWP, WebAssembly, PSVita
 - CI also builds Linux `x64`, `x32`, `arm64`, `arm32` and Windows `x64`/`x32` packages
 
 Desktop and Android are the main day-to-day targets. The other ports are present and buildable, but they are more platform-specific and may lag behind the desktop path.
@@ -104,6 +104,33 @@ Set `ANDROID_NDK_ROOT` to an NDK 27+ install and build:
 ```sh
 ./build.sh android
 ```
+
+### Meta Quest
+The `quest` Gradle flavor is a standalone immersive APK for Quest 2, Quest Pro, Quest 3 and Quest 3S. It runs the whole frontend (library, settings, pause menu and the game) on a curved virtual screen, and maps the Touch controllers to the pad. Build the native library as for Android, then:
+
+```sh
+cd android
+gradle :app:assembleQuestDebug   # Gradle 8.13+; app/build/outputs/apk/quest/debug/app-quest-debug.apk
+adb install -r app/build/outputs/apk/quest/debug/app-quest-debug.apk
+```
+
+The Quest build installs as `com.nanodata.armsx.quest` next to the phone build (`phone` flavor, `com.nanodata.armsx`). Both use the same `libarmsx.so`; the quest activity switches it into VR mode, and only the quest APK carries the Khronos OpenXR loader.
+
+The frontend still draws with the SDL GLES renderer, but into an offscreen texture. An XR thread copies each frame into an OpenXR swapchain and submits it as a cylinder layer (a flat quad when curved is off). The compositor renders that layer per eye, so the screen sits in the room with real stereoscopic depth. The PlayStation image itself is flat, because the console has no depth buffer. The emulator keeps its own 60/50 Hz pacing; the headset runs at 120 Hz when offered, so each NTSC frame is shown exactly twice.
+
+| Touch controller | In game | In menus |
+| --- | --- | --- |
+| A / B / X / Y | Cross / Circle / Square / Triangle | Accept / Back / FSUI actions |
+| Grips / Triggers | L1 R1 / L2 R2 | Grips switch pages; trigger clicks where you point |
+| Left stick | Analog; a hard push is the D-pad | Navigate |
+| Right stick | Analog | Scroll |
+| Left / right stick click | Start / Select | |
+| Menu | Open the pause menu | Close the pause menu |
+| Menu + left / right stick click | L3 / R3 | |
+| Menu + B | Left stick analog-only (toggle) | |
+| Menu + right trigger | Recenter the screen | Recenter the screen |
+
+Screen width, distance and curvature are under **Settings → VR Screen** and are stored in `settings.toml` under `[vr]`. Opening the system menu or taking the headset off pauses the game. OpenXR messages are logged with the `ARMSX-XR` tag (`adb logcat -s ARMSX-XR`). For frame timing and audio queue statistics every two seconds, run `adb shell setprop debug.armsx.perf 1` before starting the app and read them with `adb logcat -s ARMSX-PERF`.
 
 ### iOS
 Use the bundled SDL2 xcframework and run:
@@ -178,3 +205,4 @@ ARMSX uses:
 - SDL2
 - FSUI donor / ImGui
 - libchdr
+- OpenXR headers and loader (Khronos)
