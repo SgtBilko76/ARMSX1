@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <ctime>
 #include <exception>
 #include <filesystem>
@@ -90,6 +91,7 @@ extern "C" {
 #include "imgui_impl_sdlrenderer2.h"
 #include "vr/parallel_for.h"
 #include "vr/stereo_reproject.h"
+#include "vr/thread_affinity.h"
 #include "vr/vr_host.h"
 
 #undef main
@@ -2113,7 +2115,10 @@ class ArmsxSession {
         desired.callback = nullptr;
         desired.userdata = nullptr;
 
-        audio_dev_ = SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, 0);
+        {
+            const armsx::vr::ScopedUnpinned unpinned;
+            audio_dev_ = SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, 0);
+        }
         paused_ = false;
         fast_forward_enabled_ = false;
         debug_view_ = false;
@@ -2562,6 +2567,7 @@ class ArmsxSession {
         // Nothing queued from before belongs to the restored moment.
         clearQueuedAudio();
         texture_snapshot_.clear();
+        finishStereoJob(true);
         stereo_ready_ = false;
         return true;
     }
@@ -2793,6 +2799,7 @@ class ArmsxSession {
 
   private:
     void destroyStereoTexture() {
+        finishStereoJob(true);
         for (SDL_Texture*& texture : stereo_texture_) {
             if (texture) {
                 SDL_DestroyTexture(texture);
@@ -2804,8 +2811,33 @@ class ArmsxSession {
         stereo_ready_ = false;
     }
 
+    // Waits for the eye images started on the previous frame and, unless `discard`, uploads them.
+    // The upload is GL work, so it stays on this (the renderer's) thread.
+    void finishStereoJob(bool discard) {
+        if (!stereo_job_pending_) {
+            return;
+        }
+        stereo_job_pending_ = false;
+        stereo_workers_->Wait();
+        if (discard || !stereo_texture_[0] || stereo_job_width_ != stereo_width_ || stereo_job_height_ != stereo_height_) {
+            return;
+        }
+        for (int eye = 0; eye < 2; eye++) {
+            SDL_UpdateTexture(stereo_texture_[eye], nullptr, stereo_pixels_[eye].data(), stereo_width_ * static_cast<int>(sizeof(uint32_t)));
+        }
+        stereo_ready_ = true;
+    }
+
+    // The eye images run one frame behind the emulator: this frame's color and depth are copied
+    // aside and reprojected on the worker cores while the emulator thread goes on to the next
+    // frame; that next call shows them. Building them here and waiting cost the emulator thread
+    // ~2 ms a frame, which heavy scenes do not have (16.7 ms at 60 Hz).
     void updateStereoFrame(const FrontendSettings& settings, const uint16_t* color) {
         stereo_ready_ = false;
+        finishStereoJob(false);
+        const bool shown = stereo_ready_;
+        stereo_ready_ = false;
+
         const float* depth = psx_ ? psx_get_display_depth(psx_) : nullptr;
         // 24-bit frames are FMV, which has no depth; the debug view is VRAM itself.
         if (!stereo_enabled_ || debug_view_ || !color || !depth || texture_format_ != SDL_PIXELFORMAT_BGR555 ||
@@ -2821,9 +2853,12 @@ class ArmsxSession {
             return;
         }
 
-        const int width = texture_width_ * params.scale;
+        const int source_width = texture_width_;
+        const int width = source_width * params.scale;
         const int height = texture_height_;
+        bool keep_shown = shown;
         if (!stereo_texture_[0] || stereo_width_ != width || stereo_height_ != height) {
+            keep_shown = false; // new, empty textures
             destroyStereoTexture();
             // RGBA, the GLES renderer's native format: SDL uploads it as is. (BGR555 like the mono
             // texture would be converted pixel by pixel on the CPU at every upload.)
@@ -2844,29 +2879,43 @@ class ArmsxSession {
 #else
         (void)settings;
 #endif
+        // The previous frame's images, if they matched this size, stay on show for this frame.
+        stereo_ready_ = keep_shown;
 
-        // Both eyes, each in row bands, spread over idle cores: this runs on the emulator's own
-        // thread between frames, where every millisecond is taken from the game.
-        const std::array<uint32_t, 0x8000>& to_rgba = Bgr555ToRgbaTable();
+        // Private copies: the emulator overwrites VRAM and depth while the workers read them.
         constexpr int kRowStride = PSX_GPU_FB_STRIDE / static_cast<int>(sizeof(uint16_t));
+        const size_t source_pixels = static_cast<size_t>(source_width) * static_cast<size_t>(height);
+        stereo_color_copy_.resize(source_pixels);
+        stereo_depth_copy_.resize(source_pixels);
+        for (int y = 0; y < height; y++) {
+            std::memcpy(stereo_color_copy_.data() + static_cast<size_t>(y) * source_width, color + y * kRowStride,
+                static_cast<size_t>(source_width) * sizeof(uint16_t));
+            std::memcpy(stereo_depth_copy_.data() + static_cast<size_t>(y) * source_width, depth + y * kRowStride,
+                static_cast<size_t>(source_width) * sizeof(float));
+        }
         for (std::vector<uint32_t>& pixels : stereo_pixels_) {
             pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
         }
         if (!stereo_workers_) {
-            stereo_workers_ = std::make_unique<armsx::vr::ParallelFor>(kStereoTasks - 1);
+            const armsx::vr::ScopedUnpinned unpinned;
+            stereo_workers_ = std::make_unique<armsx::vr::ParallelFor>(kStereoTasks);
         }
+
+        // Both eyes, each in row bands, one band per worker.
         const int band = (height + kStereoBands - 1) / kStereoBands;
-        stereo_workers_->Run(kStereoTasks, [&](int task) {
+        stereo_task_ = [this, params, source_width, width, height, band](int task) {
+            const std::array<uint32_t, 0x8000>& to_rgba = Bgr555ToRgbaTable();
             const int eye = task / kStereoBands;
             const int first_row = (task % kStereoBands) * band;
             const int last_row = std::min(height, first_row + band);
             std::vector<uint16_t>& row = stereo_rows_[task];
             row.resize(static_cast<size_t>(width));
             for (int y = first_row; y < last_row; y++) {
+                const size_t source_row = static_cast<size_t>(y) * static_cast<size_t>(source_width);
                 stereo_reprojectors_[task].ReprojectRow(
-                    color + y * kRowStride,
-                    depth + y * kRowStride,
-                    texture_width_,
+                    stereo_color_copy_.data() + source_row,
+                    stereo_depth_copy_.data() + source_row,
+                    source_width,
                     eye == 0 ? -1 : 1,
                     params,
                     row.data());
@@ -2875,11 +2924,11 @@ class ArmsxSession {
                     out[x] = to_rgba[row[static_cast<size_t>(x)] & 0x7fff];
                 }
             }
-        });
-        for (int eye = 0; eye < 2; eye++) {
-            SDL_UpdateTexture(stereo_texture_[eye], nullptr, stereo_pixels_[eye].data(), width * static_cast<int>(sizeof(uint32_t)));
-        }
-        stereo_ready_ = true;
+        };
+        stereo_job_width_ = width;
+        stereo_job_height_ = height;
+        stereo_job_pending_ = true;
+        stereo_workers_->Start(kStereoTasks, stereo_task_);
     }
 
     // BGR555 -> RGBA bytes, expanding 5 bits to 8 the way SDL does (floor(v * 255 / 31)), so the
@@ -3071,6 +3120,9 @@ class ArmsxSession {
         MixPsxAudio(psx_, frame_audio.data(), static_cast<int>(frame_audio.size()));
 
         size_t queue_before = static_cast<size_t>(SDL_GetQueuedAudioSize(audio_dev_));
+        if (audio_playback_started_) {
+            StretchFrameAudio(frame_audio, queue_before);
+        }
         if (audio_playback_started_ && queue_before == 0) {
             audio_underruns_++;
         }
@@ -3119,6 +3171,52 @@ class ArmsxSession {
 #endif
     }
 
+    // Dynamic rate control. When the emulator runs a little slower than real time (heavy scenes,
+    // 55-59 fps), every frame delivers fewer samples than the device plays, the queue drains and
+    // each empty moment is a click. Below the target fill this frame's samples are resampled to
+    // up to kMaxAudioStretch more (a pitch drop of under a semitone, which goes unnoticed next to
+    // a crackle); above it, very slightly fewer, so the delay does not grow either.
+    void StretchFrameAudio(std::vector<uint8_t>& frame_audio, size_t queued_bytes) {
+        const int in_frames = static_cast<int>(frame_audio.size() / kAudioBytesPerSampleFrame);
+        if (in_frames < 2) {
+            return;
+        }
+        const double fill = static_cast<double>(queued_bytes) / static_cast<double>(kAudioTargetQueueBytes);
+        double ratio = 1.0;
+        if (fill < 1.0) {
+            ratio = 1.0 + kMaxAudioStretch * std::min(1.0, 1.0 - fill);
+        } else if (fill > 1.5) {
+            ratio = 1.0 - 0.005;
+        }
+        if (ratio == 1.0) {
+            return;
+        }
+
+        // Fractional output frames carry over to the next frame, so the long-run rate is exact.
+        const double wanted = static_cast<double>(in_frames) * ratio + audio_sample_accumulator_;
+        const int out_frames = static_cast<int>(wanted);
+        audio_sample_accumulator_ = wanted - static_cast<double>(out_frames);
+        if (out_frames < 2 || out_frames == in_frames) {
+            return;
+        }
+
+        const auto* in = reinterpret_cast<const int16_t*>(frame_audio.data());
+        std::vector<uint8_t> stretched(static_cast<size_t>(out_frames) * kAudioBytesPerSampleFrame);
+        auto* out = reinterpret_cast<int16_t*>(stretched.data());
+        const double step = static_cast<double>(in_frames - 1) / static_cast<double>(out_frames - 1);
+        for (int i = 0; i < out_frames; i++) {
+            const double pos = static_cast<double>(i) * step;
+            const int a = std::min(static_cast<int>(pos), in_frames - 1);
+            const int b = std::min(a + 1, in_frames - 1);
+            const double t = pos - static_cast<double>(a);
+            for (int c = 0; c < 2; c++) {
+                const double v = in[a * 2 + c] * (1.0 - t) + in[b * 2 + c] * t;
+                out[i * 2 + c] = static_cast<int16_t>(std::lround(v));
+            }
+        }
+        frame_audio.swap(stretched);
+    }
+
     void clearQueuedAudio() {
         audio_sample_accumulator_ = 0.0;
         audio_playback_started_ = false;
@@ -3136,6 +3234,10 @@ class ArmsxSession {
         static_cast<size_t>(kAudioMixRate * kAudioBytesPerSampleFrame * 50 / 1000);
     static constexpr size_t kMaxQueuedAudioBytes =
         static_cast<size_t>(kAudioMixRate * kAudioBytesPerSampleFrame * 200 / 1000);
+    // Dynamic rate control (StretchFrameAudio): the fill it steers toward, and its largest stretch.
+    static constexpr size_t kAudioTargetQueueBytes =
+        static_cast<size_t>(kAudioMixRate * kAudioBytesPerSampleFrame * 80 / 1000);
+    static constexpr double kMaxAudioStretch = 0.08;
     static constexpr std::uint32_t kMaxFrameSteps = PSX_CPU_CPS / 8u;
 
     SDL_Renderer* renderer_ = nullptr;
@@ -3159,6 +3261,13 @@ class ArmsxSession {
     static constexpr int kStereoTasks = 2 * kStereoBands;
     std::vector<uint16_t> stereo_rows_[kStereoTasks];
     armsx::vr::StereoReprojector stereo_reprojectors_[kStereoTasks];
+    std::vector<uint16_t> stereo_color_copy_;
+    std::vector<float> stereo_depth_copy_;
+    std::function<void(int)> stereo_task_;
+    bool stereo_job_pending_ = false;
+    int stereo_job_width_ = 0;
+    int stereo_job_height_ = 0;
+    // Declared last, destroyed first: its threads are joined before what the task touches goes.
     std::unique_ptr<armsx::vr::ParallelFor> stereo_workers_;
 #ifdef USE_HARDWARE
     armsx_hw_renderer_t* hw_renderer_ = nullptr;
@@ -6736,6 +6845,15 @@ class ArmsxApp {
         vr_width_ = width;
         vr_height_ = height;
         psxe_diag_logf("vr", "VR mode active screen=%dx%d", width, height);
+
+        // This thread runs the emulator; on a slow core heavy scenes miss 60 fps and the audio
+        // queue drains.
+        std::string pinning;
+        armsx::vr::PinCurrentThreadToFastCores(pinning);
+        psxe_diag_logf("vr", "emulator thread: %s", pinning.c_str());
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_INFO, "ARMSX-PERF", "emulator thread: %s", pinning.c_str());
+#endif
     }
 
     // Controllers -> pad, Menu tap -> pause menu, focus loss -> pause. Runs once per frame, before
@@ -6931,6 +7049,7 @@ class ArmsxApp {
         vr_probe_.texture_total_ms += CounterTicksToMilliseconds(texture_ticks);
         vr_probe_.submit_total_ms += CounterTicksToMilliseconds(submit_ticks);
         vr_probe_.work_max_ms = std::max(vr_probe_.work_max_ms, work_ms);
+        vr_probe_.slow_core_frames += armsx::vr::OnSlowCore() ? 1 : 0;
         vr_probe_.late_frames += work_ms > 1000.0 / std::max(currentTargetFrameRate(), 1.0) ? 1 : 0;
         const double queued = session_.valid() ? session_.queuedAudioMs() : -1.0;
         if (queued >= 0.0) {
@@ -6950,7 +7069,7 @@ class ArmsxApp {
         psxe_diag_logf("perf",
 #endif
             "emu_fps=%.2f loop_fps=%.2f work_avg=%.2fms work_max=%.2fms emulate_avg=%.2fms emulate_max=%.2fms "
-            "texture3d_avg=%.2fms submit_avg=%.2fms (begin=%.2f draw=%.2f end=%.2f) ui_avg=%.2fms late=%u audio_queue=%.0f..%.0fms underruns=%llu\n",
+            "texture3d_avg=%.2fms submit_avg=%.2fms (begin=%.2f draw=%.2f end=%.2f) ui_avg=%.2fms late=%u slow_core=%u audio_queue=%.0f..%.0fms underruns=%llu\n",
             vr_probe_.emulated * 1000.0 / window_ms,
             vr_probe_.frames * 1000.0 / window_ms,
             vr_probe_.work_total_ms / frames,
@@ -6964,6 +7083,7 @@ class ArmsxApp {
             vr_probe_.end_total_ms / frames,
             (vr_probe_.work_total_ms - vr_probe_.emulate_total_ms - vr_probe_.texture_total_ms - vr_probe_.submit_total_ms) / frames,
             vr_probe_.late_frames,
+            vr_probe_.slow_core_frames,
             vr_probe_.audio_min_ms > 1e8 ? -1.0 : vr_probe_.audio_min_ms,
             vr_probe_.audio_max_ms,
             static_cast<unsigned long long>(underruns - std::min(underruns, vr_probe_.underruns_at_start)));
@@ -7218,6 +7338,7 @@ class ArmsxApp {
         uint32_t frames = 0;
         uint32_t emulated = 0;
         uint32_t late_frames = 0;
+        uint32_t slow_core_frames = 0;
         double work_total_ms = 0.0;
         double work_max_ms = 0.0;
         double emulate_total_ms = 0.0;

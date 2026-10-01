@@ -38,6 +38,17 @@ namespace armsx::vr
 		// once all of them have finished.
 		void Run(int count, const std::function<void(int)>& task)
 		{
+			Start(count, task);
+			Drain();
+			Wait();
+		}
+
+		// Hands task(0 .. count-1) to the workers only and returns at once, so the caller can get
+		// on with other work. `task` must stay alive until Wait(). A pool with no workers runs
+		// the tasks right here.
+		void Start(int count, const std::function<void(int)>& task)
+		{
+			Wait();
 			{
 				std::lock_guard<std::mutex> lock(m_mutex);
 				m_task = &task;
@@ -47,10 +58,22 @@ namespace armsx::vr
 				m_generation++;
 			}
 			m_wake.notify_all();
-			Drain();
+			if (m_threads.empty())
+				Drain();
+		}
+
+		// Blocks until the tasks from Start() are done (returns at once if there are none).
+		void Wait()
+		{
 			std::unique_lock<std::mutex> lock(m_mutex);
 			m_done.wait(lock, [this] { return m_pending == 0; });
 			m_task = nullptr;
+		}
+
+		bool Busy()
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			return m_pending != 0;
 		}
 
 	private:

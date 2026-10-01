@@ -294,14 +294,16 @@ void gpu_render_triangle(psx_gpu_t* gpu, vertex_t v0, vertex_t v1, vertex_t v2, 
 
     float area = EDGE(a, b, c);
 
-    for (int y = ymin; y < ymax; y++) {
-        for (int x = xmin; x < xmax; x++) {
-            int bc = (x >= gpu->draw_x1) && (x <= gpu->draw_x2) &&
-                     (y >= gpu->draw_y1) && (y <= gpu->draw_y2);
+    // Only the part of the bounding box inside the drawing area: every pixel outside it was
+    // skipped anyway, but walking them cost most of the rasterizer's time on large or
+    // off-screen triangles. xmin/ymin stay unclamped, the dither pattern is anchored to them.
+    const int y_first = max(ymin, gpu->draw_y1);
+    const int y_end = min(ymax, gpu->draw_y2 + 1);
+    const int x_first = max(xmin, gpu->draw_x1);
+    const int x_end = min(xmax, gpu->draw_x2 + 1);
 
-            if (!bc)
-                continue;
-
+    for (int y = y_first; y < y_end; y++) {
+        for (int x = x_first; x < x_end; x++) {
             p.x = x;
             p.y = y;
 

@@ -28,8 +28,9 @@ extern int g_psx_depth_capture;
 
 void psx_depth_set_capture(int enabled);
 
-/* Called at every vblank. Projections older than the previous frame are forgotten: a 2D sprite
-   drawn later at a screen position some 3D vertex once had must not inherit its depth. */
+/* Called at every vblank. Projections older than a few vblanks are forgotten (depth.c,
+   DEPTH_MAX_AGE): a 2D sprite drawn later at a screen position some 3D vertex once had must not
+   inherit its depth, but 30 fps games draw two or three vblanks after projecting. */
 void psx_depth_new_frame(void);
 void psx_depth_record(uint32_t sxy, uint32_t h, uint32_t sz);
 
