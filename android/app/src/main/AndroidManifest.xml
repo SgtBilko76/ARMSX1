@@ -3,7 +3,7 @@
     <application
         android:name="android.app.Application"
         android:allowBackup="false"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@drawable/armsx_icon"
         android:label="ARMSX"
         android:theme="@style/AppTheme">
 
