@@ -119,6 +119,8 @@ The Quest build installs as `com.nanodata.armsx.quest` next to the phone build (
 
 The frontend still draws with the SDL GLES renderer, but into an offscreen texture. An XR thread copies each frame into an OpenXR swapchain and submits it as a cylinder layer (a flat quad when curved is off). The compositor renders that layer per eye, so the screen sits in the room with real stereoscopic depth. The PlayStation image itself is flat, because the console has no depth buffer. The emulator keeps its own 60/50 Hz pacing; the headset runs at 120 Hz when offered, so each NTSC frame is shown exactly twice.
 
+![ARMSX1 3D controller mapping](docs/controls.webp)
+
 | Touch controller | In game | In menus |
 | --- | --- | --- |
 | A / B / X / Y | Cross / Circle / Square / Triangle | Accept / Back / FSUI actions |
