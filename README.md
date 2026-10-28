@@ -107,6 +107,9 @@ Set `ANDROID_NDK_ROOT` to an NDK 27+ install and build:
 ```
 
 ### Meta Quest
+
+**Download, install guide, controls and pictures: [portroyale.online/armsx1.html](https://portroyale.online/armsx1.html)**
+
 The `quest` Gradle flavor is a standalone immersive APK for Quest 2, Quest Pro, Quest 3 and Quest 3S. It runs the whole frontend (library, settings, pause menu and the game) on a curved virtual screen, and maps the Touch controllers to the pad. Build the native library as for Android, then:
 
 ```sh
